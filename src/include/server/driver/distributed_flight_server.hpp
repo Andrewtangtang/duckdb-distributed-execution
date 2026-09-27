@@ -2,7 +2,10 @@
 
 #include "distributed.pb.h"
 #include "duckdb.hpp"
+#include "duckdb/common/atomic.hpp"
+#include "duckdb/common/mutex.hpp"
 #include "duckdb/common/string.hpp"
+#include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/unique_ptr.hpp"
 #include "server/driver/distributed_executor.hpp"
 #include "server/driver/query_plan_analyzer.hpp"
@@ -12,7 +15,7 @@
 #include <arrow/record_batch.h>
 #include <chrono>
 #include <memory>
-#include <mutex>
+#include <shared_mutex>
 
 namespace duckdb {
 
@@ -94,6 +97,7 @@ public:
 	                    std::unique_ptr<arrow::flight::FlightMetadataWriter> writer) override;
 
 	DatabaseInstance &GetDatabaseInstance();
+	void SetClientLeaseTimeoutForTesting(std::chrono::milliseconds timeout);
 
 private:
 	// Implementation methods for Flight RPC handlers, without exception handling.
@@ -108,6 +112,9 @@ private:
 	                        std::unique_ptr<arrow::flight::FlightMetadataWriter> writer);
 
 	// Process different request types using protobuf messages directly.
+	arrow::Status HandleRegisterClient(const distributed::RegisterClientRequest &req,
+	                                   distributed::DistributedResponse &resp);
+	arrow::Status HandleUnregisterClient(const string &client_id, distributed::DistributedResponse &resp);
 	arrow::Status HandleExecuteSQL(const distributed::ExecuteSQLRequest &req, distributed::DistributedResponse &resp);
 
 	// Handle CREATE TABLE request.
@@ -153,6 +160,22 @@ private:
 private:
 	// Initialize DuckDB instance, connection, and components.
 	void Initialize();
+	struct ClientRegistration {
+		explicit ClientRegistration(distributed::ClientRole role_p);
+
+		distributed::ClientRole role;
+		// Last authorized request time in steady-clock milliseconds, updated concurrently by RPC handlers.
+		atomic<int64_t> last_seen;
+	};
+
+	// Look up a registration while the caller holds clients_mutex.
+	bool LookupClient(const string &client_id, shared_ptr<ClientRegistration> &registration);
+	// Renew a client's lease after an authorized request.
+	void TouchClient(const shared_ptr<ClientRegistration> &registration);
+	// Remove expired registrations while the caller holds clients_mutex exclusively.
+	void PruneExpiredClients();
+	// Validate registration and role while the caller holds clients_mutex, renewing the lease on success.
+	bool AuthorizeClient(const string &client_id, bool require_write, distributed::DistributedResponse &resp);
 	string host;
 	int port;
 	unique_ptr<DuckDB> db;
@@ -160,8 +183,14 @@ private:
 	unique_ptr<WorkerManager> worker_manager;
 	unique_ptr<DistributedExecutor> distributed_executor;
 
+	// Client admission: at most one writable attachment, with any number of readers.
+	mutable std::shared_mutex clients_mutex;
+	unordered_map<string, shared_ptr<ClientRegistration>> clients;
+	string writable_client_id;
+	std::chrono::milliseconds client_lease_timeout = std::chrono::seconds(30);
+
 	// Query execution tracking.
-	mutable std::mutex query_history_mutex;
+	mutable mutex query_history_mutex;
 	vector<QueryExecutionInfo> query_history;
 };
 
