@@ -6,6 +6,7 @@
 #include "duckdb/common/unique_ptr.hpp"
 #include "server/driver/distributed_executor.hpp"
 #include "server/driver/query_plan_analyzer.hpp"
+#include "server/driver/query_utils.hpp"
 #include "server/driver/worker_manager.hpp"
 
 #include <arrow/flight/api.h>
@@ -43,7 +44,8 @@ struct QueryExecutionInfo {
 // Arrow Flight-based RPC server for distributed execution.
 class DistributedFlightServer : public arrow::flight::FlightServerBase {
 public:
-	explicit DistributedFlightServer(string host_p = "0.0.0.0", int port_p = 8815, string init_sql_file_p = "");
+	explicit DistributedFlightServer(string host_p = "0.0.0.0", int port_p = 8815,
+	                                 ObjectStorageConfig storage_config_p = {});
 	~DistributedFlightServer() override = default;
 
 	// Start the server.
@@ -155,7 +157,7 @@ private:
 	void Initialize();
 	string host;
 	int port;
-	string init_sql_file;
+	ObjectStorageConfig storage_config;
 	unique_ptr<DuckDB> db;
 	unique_ptr<Connection> conn;
 	unique_ptr<WorkerManager> worker_manager;

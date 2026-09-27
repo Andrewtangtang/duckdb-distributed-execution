@@ -50,23 +50,23 @@ def main():
         sys.path.insert(0, str(work))
         proto = importlib.import_module("distributed_pb2")
 
-        def action(client, request):
+        def action(client, request, expect_success=True):
             results = list(client.do_action(
                 flight.Action("execute", request.SerializeToString()), options=OPTIONS,
             ))
             assert len(results) == 1
             response = proto.DistributedResponse.FromString(results[0].body.to_pybytes())
-            assert response.success, response.error_message
+            assert response.success == expect_success, response.error_message
             return response
 
-        def start(role, init_file=None):
+        def start(role, storage_args=()):
             port = free_port()
             log = open(work / f"{role}-{port}.log", "w+")
             logs.append(log)
             process = subprocess.Popen(
                 [str(binaries / f"distributed_{role}"), "127.0.0.1", str(port),
                  "0" if role == "server" else f"worker-{port}"]
-                + ([str(init_file)] if init_file is not None else []),
+                + list(storage_args),
                 stdout=log, stderr=log,
             )
             processes.append(process)
@@ -99,32 +99,39 @@ def main():
             return client.do_get(flight.Ticket(request.SerializeToString()), options=OPTIONS).read_all()
 
         try:
+            storage_root = work / "storage's root"
             setup = (
                 "LOAD duckdb_object_storage;\n"
                 "SET duckdb_objfs_backend = 'local';\n"
-                f"SET duckdb_objfs_root = {sql_string(work / 'storage')};\n"
+                f"SET duckdb_objfs_root = {sql_string(storage_root)};\n"
             )
             subprocess.run([str(duckdb), "-bail"], input=setup + """
                 ATTACH 'duckdb_objfs://shared.db' AS object_db;
                 CREATE TABLE object_db.items AS SELECT i FROM range(3) t(i);
                 CHECKPOINT object_db;
             """, text=True, check=True, capture_output=True)
-            init_file = work / "reader.sql"
-            init_file.write_text(setup + "ATTACH 'duckdb_objfs://shared.db' AS object_db (READ_ONLY);\n")
-            driver_init = work / "driver.sql"
-            driver_init.write_text(init_file.read_text() + "USE object_db;\n")
+            storage_args = ("duckdb_objfs://shared.db", "local", str(storage_root))
 
-            # Initialization must fail before the worker starts accepting tasks.
-            invalid = work / "invalid.sql"
-            invalid.write_text("SELECT * FROM missing_initialization_table;\n")
+            # Invalid configuration and failed attachments must prevent startup.
+            invalid_configs = [
+                ("ordinary.db", "local", str(storage_root)),
+                ("duckdb_objfs://", "local", str(storage_root)),
+                ("duckdb_objfs://shared.db", "unsupported", str(storage_root)),
+                ("duckdb_objfs://shared.db", "local"),
+                ("duckdb_objfs://shared.db", "s3"),
+                ("duckdb_objfs://missing.db", "local", str(storage_root)),
+                ("", "s3", "prefix", "bucket"),
+                (*storage_args, "unexpected-bucket"),
+                (*storage_args, "bucket", "extra-argument"),
+            ]
             for role in ("server", "worker"):
-                for file in (work / "missing.sql", invalid):
+                for config in invalid_configs:
                     result = subprocess.run(
                         [str(binaries / f"distributed_{role}"), "127.0.0.1", str(free_port()),
-                         "0" if role == "server" else "bad-worker", str(file)],
+                         "0" if role == "server" else "bad-worker", *config],
                         capture_output=True, text=True, timeout=30,
                     )
-                    assert result.returncode != 0
+                    assert result.returncode != 0, (role, config, result.stdout)
                     assert "started successfully" not in result.stdout
 
             # Omitting the optional argument preserves the original startup behavior.
@@ -132,11 +139,15 @@ def main():
             assert query(default_driver, "SELECT 42 AS answer").to_pylist() == [{"answer": 42}]
             start("worker")
 
-            driver, _ = start("server", driver_init)
+            driver, _ = start("server", storage_args)
             # Query before registration keeps this check independent of partition changes.
             assert query(driver, "SELECT i FROM object_db.items ORDER BY i")["i"].to_pylist() == [0, 1, 2]
+            request = proto.DistributedRequest()
+            request.execute_sql.sql = "INSERT INTO object_db.items VALUES (3)"
+            response = action(driver, request, expect_success=False)
+            assert "read-only" in response.error_message.lower()
             for index in range(2):
-                worker, port = start("worker", init_file)
+                worker, port = start("worker", storage_args)
                 request = proto.DistributedRequest()
                 request.execute_partition.sql = "SELECT i FROM object_db.items ORDER BY i"
                 request.execute_partition.partition_id = 0
@@ -145,6 +156,14 @@ def main():
                 rows = worker.do_get(flight.Ticket(request.SerializeToString()), options=OPTIONS).read_all()
                 assert rows["i"].to_pylist() == [0, 1, 2]
                 register(driver, f"reader-{index}", port)
+
+                # Startup must attach read-only, not create a second writer.
+                request.execute_partition.sql = "INSERT INTO object_db.items VALUES (3)"
+                try:
+                    worker.do_get(flight.Ticket(request.SerializeToString()), options=OPTIONS).read_all()
+                    raise AssertionError("Worker attachment allowed writes")
+                except (flight.FlightError, pa.ArrowInvalid) as error:
+                    assert "read-only" in str(error).lower()
 
             # Reject duplicate IDs/locations and malformed registrations.
             invalid_registrations = [

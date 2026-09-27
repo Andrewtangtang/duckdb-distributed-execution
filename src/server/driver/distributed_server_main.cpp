@@ -9,13 +9,16 @@
  * - Optionally starts local worker nodes for single-machine distributed execution
  *
  * Usage:
- *   ./distributed_server [host] [port] [num_workers] [init_sql_file]
+ *   ./distributed_server [host] [port] [num_workers] [database_uri] [backend] [root] [bucket]
  *
  * Arguments:
  *   host         - Host address to bind to (default: 0.0.0.0)
  *   port         - Port to listen on (default: 8815)
  *   num_workers  - Number of local workers to start (default: 0 = no distributed execution)
- *   init_sql_file - Optional SQL file executed before serving requests
+ *   database_uri - Optional duckdb_objfs:// database attached read-only as object_db
+ *   backend      - local (default) or s3
+ *   root         - Local storage directory or optional S3 key prefix
+ *   bucket       - Required for s3; omit for local
  *
  * Examples:
  *   ./distributed_server                          # Start on 0.0.0.0:8815 with no workers (local mode)
@@ -29,6 +32,7 @@
 
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/logging/logger.hpp"
+#include "server/driver/query_utils.hpp"
 #include "server/driver/distributed_flight_server.hpp"
 
 using namespace duckdb;
@@ -49,7 +53,6 @@ int main(int argc, char *argv[]) {
 	std::string host = "0.0.0.0";
 	int port = 8815;
 	int num_workers = 0; // 0 = no distributed execution, run locally
-	std::string init_sql_file;
 
 	if (argc > 1) {
 		host = argv[1];
@@ -59,9 +62,6 @@ int main(int argc, char *argv[]) {
 	}
 	if (argc > 3) {
 		num_workers = std::stoi(argv[3]);
-	}
-	if (argc > 4) {
-		init_sql_file = argv[4];
 	}
 
 	std::cout << "Starting Distributed Execution Server" << std::endl;
@@ -75,7 +75,7 @@ int main(int argc, char *argv[]) {
 
 	try {
 		// Create and start Flight server.
-		g_server = std::make_unique<DistributedFlightServer>(host, port, init_sql_file);
+		g_server = std::make_unique<DistributedFlightServer>(host, port, GetObjectStorageConfig(argc, argv));
 
 		auto LogServerError = [&](const string &message) {
 			if (g_server) {

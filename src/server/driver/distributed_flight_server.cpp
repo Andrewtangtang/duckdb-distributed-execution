@@ -18,8 +18,8 @@
 
 namespace duckdb {
 
-DistributedFlightServer::DistributedFlightServer(string host_p, int port_p, string init_sql_file_p)
-    : host(std::move(host_p)), port(port_p), init_sql_file(std::move(init_sql_file_p)) {
+DistributedFlightServer::DistributedFlightServer(string host_p, int port_p, ObjectStorageConfig storage_config_p)
+    : host(std::move(host_p)), port(port_p), storage_config(std::move(storage_config_p)) {
 	Initialize();
 }
 
@@ -93,8 +93,8 @@ void DistributedFlightServer::Initialize() {
 		throw InternalException(StringUtil::Format("Failed to USE duckling: %s", use_result->GetError()));
 	}
 
-	// Run startup SQL before creating workers or accepting requests.
-	InitializeConnection(*conn, init_sql_file);
+	// Attach the shared database before creating workers or accepting requests.
+	InitializeObjectStorage(*conn, storage_config);
 
 	// Initialize worker manager and distributed executor.
 	worker_manager = make_uniq<WorkerManager>(*db);

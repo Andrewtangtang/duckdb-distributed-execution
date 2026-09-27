@@ -4,6 +4,7 @@
 #include "duckdb.hpp"
 #include "duckdb/common/string.hpp"
 #include "duckdb/common/unique_ptr.hpp"
+#include "server/driver/query_utils.hpp"
 
 #include <arrow/flight/api.h>
 #include <memory>
@@ -14,7 +15,7 @@ namespace duckdb {
 class WorkerNode : public arrow::flight::FlightServerBase {
 public:
 	explicit WorkerNode(string worker_id_p, string host_p = "0.0.0.0", int port_p = 0, DuckDB *shared_db = nullptr,
-	                    const string &init_sql_file = "");
+	                    const ObjectStorageConfig &storage_config = {});
 	~WorkerNode() override = default;
 
 	arrow::Status Start();

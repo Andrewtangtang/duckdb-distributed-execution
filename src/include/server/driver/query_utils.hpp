@@ -9,8 +9,19 @@ class PhysicalOperator;
 class LogicalOperator;
 class Connection;
 
-// Execute a local SQL file before accepting queries.
-void InitializeConnection(Connection &conn, const string &sql_file);
+// Explicit storage settings shared by driver and worker startup hooks.
+struct ObjectStorageConfig {
+	string database_uri;
+	string backend = "local";
+	string root;
+	string bucket;
+};
+
+// Read optional storage arguments after the executable's host, port, and worker arguments.
+ObjectStorageConfig GetObjectStorageConfig(int argc, char *argv[]);
+
+// Configure ObjFS and attach object_db read-only before accepting queries.
+void InitializeObjectStorage(Connection &conn, const ObjectStorageConfig &config);
 
 // Return true if there's any TABLE_SCAN operator in the physical plan tree.
 bool ContainsTableScan(const PhysicalOperator &op);
