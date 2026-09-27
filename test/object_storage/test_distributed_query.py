@@ -49,8 +49,11 @@ def main():
         )
         sys.path.insert(0, str(work))
         proto = importlib.import_module("distributed_pb2")
+        client_ids = {}
 
         def action(client, request, expect_success=True):
+            if not request.client_id:
+                request.client_id = client_ids.get(client, "")
             results = list(client.do_action(
                 flight.Action("execute", request.SerializeToString()), options=OPTIONS,
             ))
@@ -73,12 +76,15 @@ def main():
             client = flight.FlightClient(("127.0.0.1", port))
             request = proto.DistributedRequest()
             if role == "server":
-                request.get_query_execution_stats.SetInParent()
+                request.register_client.role = proto.CLIENT_ROLE_READ_WRITE
             else:
                 request.worker_heartbeat.worker_id = "readiness"
             try:
                 client.wait_for_available(timeout=30)
-                action(client, request)
+                response = action(client, request)
+                if role == "server":
+                    client_ids[client] = response.register_client.client_id
+                    assert client_ids[client]
             except flight.FlightError:
                 log.flush()
                 log.seek(0)
@@ -94,6 +100,7 @@ def main():
 
         def query(client, sql):
             request = proto.DistributedRequest()
+            request.client_id = client_ids[client]
             request.scan_table.table_name = sql
             request.scan_table.limit = (1 << 64) - 1
             return client.do_get(flight.Ticket(request.SerializeToString()), options=OPTIONS).read_all()
@@ -161,7 +168,22 @@ def main():
                 assert "read-only" in str(error).lower()
 
             driver, _ = start("server", storage_args)
-            # Query before registration keeps this check independent of partition changes.
+
+            # Cluster changes follow the control node's existing writable-client policy.
+            request = proto.DistributedRequest()
+            request.register_client.role = proto.CLIENT_ROLE_READ_ONLY
+            reader_id = action(driver, request).register_client.client_id
+            assert reader_id
+            for client_id, expected_error in (("unknown-client", "not registered"), (reader_id, "read-only")):
+                request = proto.DistributedRequest()
+                request.client_id = client_id
+                request.worker_register.worker_id = "forbidden-reader"
+                request.worker_register.host = "127.0.0.1"
+                request.worker_register.port = free_port()
+                response = action(driver, request, expect_success=False)
+                assert expected_error in response.error_message.lower()
+
+            # Query before worker registration keeps this check independent of partition changes.
             assert query(driver, "SELECT i FROM object_db.items ORDER BY i")["i"].to_pylist() == [0, 1, 2]
             request = proto.DistributedRequest()
             request.execute_sql.sql = "INSERT INTO object_db.items VALUES (3)"

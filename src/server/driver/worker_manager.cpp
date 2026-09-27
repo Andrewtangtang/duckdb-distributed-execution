@@ -8,7 +8,7 @@
 namespace duckdb {
 
 void WorkerManager::RegisterWorker(const string &worker_id, const string &location) {
-	std::lock_guard<std::mutex> lck(mu);
+	lock_guard<mutex> lck(mu);
 	auto &db_instance = *db.instance;
 	for (const auto &worker : workers) {
 		if (worker->worker_id == worker_id || worker->location == location) {
@@ -29,7 +29,7 @@ void WorkerManager::RegisterWorker(const string &worker_id, const string &locati
 }
 
 void WorkerManager::RegisterOrReplaceDriver(const string &driver_id, const string &location) {
-	std::lock_guard<std::mutex> lck(mu);
+	lock_guard<mutex> lck(mu);
 	auto &db_instance = *db.instance;
 
 	// If a driver node already exists, log replacement.
@@ -60,7 +60,7 @@ void WorkerManager::RegisterOrReplaceDriver(const string &driver_id, const strin
 }
 
 vector<WorkerInfo *> WorkerManager::GetAvailableWorkers() {
-	std::lock_guard<std::mutex> lock(mu);
+	lock_guard<mutex> lock(mu);
 	vector<WorkerInfo *> available;
 	available.reserve(workers.size());
 
@@ -71,12 +71,12 @@ vector<WorkerInfo *> WorkerManager::GetAvailableWorkers() {
 }
 
 idx_t WorkerManager::GetWorkerCount() const {
-	std::lock_guard<std::mutex> lock(mu);
+	lock_guard<mutex> lock(mu);
 	return workers.size();
 }
 
 void WorkerManager::StartLocalWorkers(idx_t num_workers) {
-	std::lock_guard<std::mutex> lock(mu);
+	lock_guard<mutex> lock(mu);
 	auto &db_instance = *db.instance;
 
 	DUCKDB_LOG_DEBUG(db_instance, "Starting %llu local worker nodes", num_workers);
