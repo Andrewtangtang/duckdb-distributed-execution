@@ -8,12 +8,13 @@
  * - Operates independently with its own DuckDB instance and storage
  *
  * Usage:
- *   ./distributed_worker [host] [port] [worker_id]
+ *   ./distributed_worker [host] [port] [worker_id] [init_sql_file]
  *
  * Arguments:
  *   host       - Host address to bind to (default: 0.0.0.0)
  *   port       - Port to listen on (default: 8816)
  *   worker_id  - Unique identifier for this worker (default: worker-1)
+ *   init_sql_file - Optional SQL file executed before serving requests
  *
  * Examples:
  *   ./distributed_worker                                # Start on 0.0.0.0:8816 as worker-1
@@ -53,6 +54,7 @@ int main(int argc, char *argv[]) {
 	std::string host = "0.0.0.0";
 	int port = 8816;
 	std::string worker_id = "worker-1";
+	std::string init_sql_file;
 
 	if (argc > 1) {
 		host = argv[1];
@@ -62,6 +64,9 @@ int main(int argc, char *argv[]) {
 	}
 	if (argc > 3) {
 		worker_id = argv[3];
+	}
+	if (argc > 4) {
+		init_sql_file = argv[4];
 	}
 
 	std::cout << "Starting Distributed Execution Worker Node" << std::endl;
@@ -76,7 +81,7 @@ int main(int argc, char *argv[]) {
 	try {
 		// Create and start worker node.
 		// Pass nullptr for shared_db to create an independent database instance.
-		g_worker = std::make_unique<WorkerNode>(worker_id, host, port, nullptr);
+		g_worker = std::make_unique<WorkerNode>(worker_id, host, port, nullptr, init_sql_file);
 
 		auto status = g_worker->Start();
 		if (!status.ok()) {

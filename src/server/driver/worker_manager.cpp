@@ -1,6 +1,8 @@
+#include "server/driver/worker_manager.hpp"
+
+#include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/logging/logger.hpp"
-#include "server/driver/worker_manager.hpp"
 #include "utils/network_utils.hpp"
 
 namespace duckdb {
@@ -8,6 +10,11 @@ namespace duckdb {
 void WorkerManager::RegisterWorker(const string &worker_id, const string &location) {
 	std::lock_guard<std::mutex> lck(mu);
 	auto &db_instance = *db.instance;
+	for (const auto &worker : workers) {
+		if (worker->worker_id == worker_id || worker->location == location) {
+			throw InvalidInputException("Worker %s at %s is already registered", worker_id, location);
+		}
+	}
 
 	auto worker_info = make_uniq<WorkerInfo>(worker_id, location);
 
@@ -53,17 +60,18 @@ void WorkerManager::RegisterOrReplaceDriver(const string &driver_id, const strin
 }
 
 vector<WorkerInfo *> WorkerManager::GetAvailableWorkers() {
+	std::lock_guard<std::mutex> lock(mu);
 	vector<WorkerInfo *> available;
 	available.reserve(workers.size());
 
-	std::lock_guard<std::mutex> lock(mu);
-	for (auto &worker : workers) {
+	for (const auto &worker : workers) {
 		available.emplace_back(worker.get());
 	}
 	return available;
 }
 
 idx_t WorkerManager::GetWorkerCount() const {
+	std::lock_guard<std::mutex> lock(mu);
 	return workers.size();
 }
 

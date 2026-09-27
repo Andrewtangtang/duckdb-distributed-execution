@@ -9,12 +9,13 @@
  * - Optionally starts local worker nodes for single-machine distributed execution
  *
  * Usage:
- *   ./distributed_server [host] [port] [num_workers]
+ *   ./distributed_server [host] [port] [num_workers] [init_sql_file]
  *
  * Arguments:
  *   host         - Host address to bind to (default: 0.0.0.0)
  *   port         - Port to listen on (default: 8815)
  *   num_workers  - Number of local workers to start (default: 0 = no distributed execution)
+ *   init_sql_file - Optional SQL file executed before serving requests
  *
  * Examples:
  *   ./distributed_server                          # Start on 0.0.0.0:8815 with no workers (local mode)
@@ -48,6 +49,7 @@ int main(int argc, char *argv[]) {
 	std::string host = "0.0.0.0";
 	int port = 8815;
 	int num_workers = 0; // 0 = no distributed execution, run locally
+	std::string init_sql_file;
 
 	if (argc > 1) {
 		host = argv[1];
@@ -57,6 +59,9 @@ int main(int argc, char *argv[]) {
 	}
 	if (argc > 3) {
 		num_workers = std::stoi(argv[3]);
+	}
+	if (argc > 4) {
+		init_sql_file = argv[4];
 	}
 
 	std::cout << "Starting Distributed Execution Server" << std::endl;
@@ -70,7 +75,7 @@ int main(int argc, char *argv[]) {
 
 	try {
 		// Create and start Flight server.
-		g_server = std::make_unique<DistributedFlightServer>(host, port);
+		g_server = std::make_unique<DistributedFlightServer>(host, port, init_sql_file);
 
 		auto LogServerError = [&](const string &message) {
 			if (g_server) {

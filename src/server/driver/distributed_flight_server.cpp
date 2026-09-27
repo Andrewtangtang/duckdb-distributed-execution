@@ -8,6 +8,7 @@
 #include "duckdb/main/config.hpp"
 #include "query_common.hpp"
 #include "server/driver/duckling_storage.hpp"
+#include "server/driver/query_utils.hpp"
 
 #include <arrow/array.h>
 #include <arrow/c/bridge.h>
@@ -17,7 +18,8 @@
 
 namespace duckdb {
 
-DistributedFlightServer::DistributedFlightServer(string host_p, int port_p) : host(std::move(host_p)), port(port_p) {
+DistributedFlightServer::DistributedFlightServer(string host_p, int port_p, string init_sql_file_p)
+    : host(std::move(host_p)), port(port_p), init_sql_file(std::move(init_sql_file_p)) {
 	Initialize();
 }
 
@@ -91,6 +93,9 @@ void DistributedFlightServer::Initialize() {
 		throw InternalException(StringUtil::Format("Failed to USE duckling: %s", use_result->GetError()));
 	}
 
+	// Run startup SQL before creating workers or accepting requests.
+	InitializeConnection(*conn, init_sql_file);
+
 	// Initialize worker manager and distributed executor.
 	worker_manager = make_uniq<WorkerManager>(*db);
 	distributed_executor = make_uniq<DistributedExecutor>(*worker_manager, *conn);
@@ -140,6 +145,17 @@ arrow::Status DistributedFlightServer::DoActionImpl(const arrow::flight::ServerC
 	response.set_success(true);
 
 	switch (request.request_case()) {
+	case distributed::DistributedRequest::kWorkerRegister: {
+		const auto &req = request.worker_register();
+		if (req.worker_id().empty() || req.host().empty() || req.port() == 0 || req.port() > 65535) {
+			return arrow::Status::Invalid("Worker registration requires an ID, host, and valid port");
+		}
+		arrow::flight::Location location;
+		ARROW_ASSIGN_OR_RAISE(location, arrow::flight::Location::ForGrpcTcp(req.host(), req.port()));
+		RegisterWorker(req.worker_id(), location.ToString());
+		response.mutable_worker_register()->set_accepted(true);
+		break;
+	}
 	// ========== Table perations ==========
 	case distributed::DistributedRequest::kCreateTable:
 		ARROW_RETURN_NOT_OK(HandleCreateTable(request.create_table(), response));
