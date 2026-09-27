@@ -1,5 +1,6 @@
 #include "server/driver/distributed_flight_server.hpp"
 
+#include "client.pb.h"
 #include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
@@ -68,12 +69,12 @@ string StripClientCatalog(const string &sql, const string &client_catalog) {
 
 DistributedFlightServer::ClientRegistration::ClientRegistration(DuckDB &db, WorkerManager &worker_manager,
                                                                 distributed::ClientRole role_p,
-                                                                const StorageConfig &storage_config)
+                                                                const distributed::StorageConfig &storage_config)
     : role(role_p), last_seen(GetSteadyNowMilliSecSinceEpoch()), connection(make_uniq<Connection>(db)) {
 	// Attach the requested database when initializing this client's connection.
 	InitializeStorage(*connection, storage_config);
 	// Set the attached database, or duckling when none was requested, as this session's default.
-	auto use_result = connection->Query(storage_config.database_uri.empty() ? "USE duckling" : "USE object_db");
+	auto use_result = connection->Query(storage_config.database_uri().empty() ? "USE duckling" : "USE object_db");
 	if (use_result->HasError()) {
 		throw InternalException(
 		    StringUtil::Format("Failed to set default database for client connection: %s", use_result->GetError()));
@@ -81,8 +82,7 @@ DistributedFlightServer::ClientRegistration::ClientRegistration(DuckDB &db, Work
 	distributed_executor = make_uniq<DistributedExecutor>(worker_manager, *connection);
 }
 
-DistributedFlightServer::DistributedFlightServer(string host_p, int port_p, StorageConfig storage_config_p)
-    : host(std::move(host_p)), port(port_p), storage_config(std::move(storage_config_p)) {
+DistributedFlightServer::DistributedFlightServer(string host_p, int port_p) : host(std::move(host_p)), port(port_p) {
 	Initialize();
 }
 
@@ -157,9 +157,8 @@ void DistributedFlightServer::Initialize() {
 		throw InternalException(StringUtil::Format("Failed to attach Duckling: %s", result->GetError()));
 	}
 
-	// Attach the shared database before creating workers or accepting requests.
-	// Secrets and attached databases are shared by the instance's client connections.
-	InitializeStorage(bootstrap_conn, storage_config);
+	// Storage is selected by client registration and shared by the instance's connections.
+	storage_config.Clear();
 
 	// Initialize the worker manager. Each client registration owns its connection-bound executor.
 	worker_manager = make_uniq<WorkerManager>(*db);
@@ -263,19 +262,19 @@ arrow::Status DistributedFlightServer::HandleRegisterClient(const distributed::R
 		return arrow::Status::OK();
 	}
 
-	StorageConfig requested_storage;
-	requested_storage.database_uri = req.database_uri();
-	requested_storage.backend = req.storage_backend().empty() ? "local" : req.storage_backend();
-	requested_storage.root = req.storage_root();
-	requested_storage.bucket = req.storage_bucket();
-	if (requested_storage.database_uri.empty() && requested_storage.backend == "local" &&
-	    requested_storage.root.empty() && requested_storage.bucket.empty()) {
-		// Attachments without storage options retain the process's configured database.
+	auto requested_storage = req.storage_config();
+	if (requested_storage.backend().empty()) {
+		requested_storage.set_backend("local");
+	}
+	if (requested_storage.database_uri().empty() && requested_storage.backend() == "local" &&
+	    requested_storage.root().empty() && requested_storage.bucket().empty()) {
+		// Clients without storage options use the database already selected for this instance.
 		requested_storage = storage_config;
-	} else if (!storage_config.database_uri.empty() &&
-	           (requested_storage.database_uri != storage_config.database_uri ||
-	            requested_storage.backend != storage_config.backend || requested_storage.root != storage_config.root ||
-	            requested_storage.bucket != storage_config.bucket)) {
+	} else if (!storage_config.database_uri().empty() &&
+	           (requested_storage.database_uri() != storage_config.database_uri() ||
+	            requested_storage.backend() != storage_config.backend() ||
+	            requested_storage.root() != storage_config.root() ||
+	            requested_storage.bucket() != storage_config.bucket())) {
 		resp.set_success(false);
 		// ponytail: one storage configuration per instance; use separate instances for independent ObjFS backends.
 		resp.set_error_message("Control node already has a different storage attachment configured");
@@ -368,9 +367,7 @@ arrow::Status DistributedFlightServer::DoActionImpl(const arrow::flight::ServerC
 			break;
 		}
 		const auto &req = request.worker_register();
-		if (req.worker_id().empty() || req.host().empty() || req.port() == 0 || req.port() > 65535) {
-			return arrow::Status::Invalid("Worker registration requires an ID, host, and valid port");
-		}
+		ARROW_RETURN_NOT_OK(ValidateRequest(req));
 		arrow::flight::Location location;
 		ARROW_ASSIGN_OR_RAISE(location, arrow::flight::Location::ForGrpcTcp(req.host(), req.port()));
 		RegisterWorker(req.worker_id(), location.ToString());

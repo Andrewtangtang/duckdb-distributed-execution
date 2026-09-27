@@ -1,11 +1,11 @@
 #include "duckherder_storage.hpp"
 
+#include "client.pb.h"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckherder_catalog.hpp"
 #include "duckherder_transaction_manager.hpp"
-#include "storage_config.hpp"
 
 namespace duckdb {
 
@@ -19,7 +19,7 @@ unique_ptr<Catalog> DuckherderAttach(optional_ptr<StorageExtensionInfo> storage_
 	// Extract server configuration from ATTACH DATABASE options.
 	string server_host = "localhost";
 	int server_port = 8815;
-	StorageConfig storage_config;
+	distributed::StorageConfig storage_config;
 	const bool attach_read_only = options.access_mode == AccessMode::READ_ONLY;
 	auto role = attach_read_only ? distributed::CLIENT_ROLE_READ_ONLY : distributed::CLIENT_ROLE_READ_WRITE;
 
@@ -35,20 +35,20 @@ unique_ptr<Catalog> DuckherderAttach(optional_ptr<StorageExtensionInfo> storage_
 
 	it = options.options.find("server_db_path");
 	if (it != options.options.end()) {
-		storage_config.database_uri = it->second.ToString();
+		storage_config.set_database_uri(it->second.ToString());
 	}
 
 	it = options.options.find("storage_backend");
 	if (it != options.options.end()) {
-		storage_config.backend = it->second.ToString();
+		storage_config.set_backend(it->second.ToString());
 	}
 	it = options.options.find("storage_root");
 	if (it != options.options.end()) {
-		storage_config.root = it->second.ToString();
+		storage_config.set_root(it->second.ToString());
 	}
 	it = options.options.find("storage_bucket");
 	if (it != options.options.end()) {
-		storage_config.bucket = it->second.ToString();
+		storage_config.set_bucket(it->second.ToString());
 	}
 
 	it = options.options.find("client_role");

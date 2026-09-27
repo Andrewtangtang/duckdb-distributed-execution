@@ -1,3 +1,4 @@
+#include "client.pb.h"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/common/unordered_map.hpp"
@@ -210,7 +211,7 @@ void StartStandaloneWorker(DataChunk &args, ExpressionState &state, Vector &resu
 	}
 
 	string worker_id = StringUtil::Format("standalone_worker_%d", port);
-	auto worker = make_uniq<WorkerNode>(worker_id, "localhost", port, nullptr);
+	auto worker = make_uniq<WorkerNode>(worker_id, "localhost", port, nullptr, distributed::StorageConfig {});
 
 	auto status = worker->Start();
 	if (!status.ok()) {

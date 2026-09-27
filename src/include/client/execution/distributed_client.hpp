@@ -2,12 +2,14 @@
 
 #pragma once
 
+#include "client.pb.h"
 #include "client/transport/distributed_flight_client.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/string.hpp"
 #include "duckdb/common/unique_ptr.hpp"
+#include "query.pb.h"
 #include "query_common.hpp"
-#include "storage_config.hpp"
+#include "transaction.pb.h"
 
 namespace duckdb {
 
@@ -32,7 +34,7 @@ struct QueryExecutionStatsEntry {
 
 class DistributedClient {
 public:
-	DistributedClient(string server_url_p, distributed::ClientRole role_p, StorageConfig storage_config_p = {});
+	DistributedClient(string server_url_p, distributed::ClientRole role_p, distributed::StorageConfig storage_config_p);
 	~DistributedClient() = default;
 
 	void Close();

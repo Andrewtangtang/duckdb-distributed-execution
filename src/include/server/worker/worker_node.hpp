@@ -1,10 +1,10 @@
 #pragma once
 
+#include "client.pb.h"
 #include "distributed.pb.h"
 #include "duckdb.hpp"
 #include "duckdb/common/string.hpp"
 #include "duckdb/common/unique_ptr.hpp"
-#include "storage_config.hpp"
 
 #include <arrow/flight/api.h>
 #include <memory>
@@ -14,8 +14,8 @@ namespace duckdb {
 // Simple worker node that executes queries on partitioned data.
 class WorkerNode : public arrow::flight::FlightServerBase {
 public:
-	explicit WorkerNode(string worker_id_p, string host_p = "0.0.0.0", int port_p = 0, DuckDB *shared_db = nullptr,
-	                    const StorageConfig &storage_config = {});
+	explicit WorkerNode(string worker_id_p, string host_p, int port_p, DuckDB *shared_db,
+	                    const distributed::StorageConfig &storage_config);
 	~WorkerNode() override = default;
 
 	arrow::Status Start();

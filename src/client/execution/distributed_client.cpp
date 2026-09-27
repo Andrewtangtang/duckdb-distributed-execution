@@ -1,6 +1,7 @@
 #include "client/execution/distributed_client.hpp"
 
 #include "arrow_utils.hpp"
+#include "client.pb.h"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
@@ -14,7 +15,7 @@
 namespace duckdb {
 
 DistributedClient::DistributedClient(string server_url_p, distributed::ClientRole role_p,
-                                     StorageConfig storage_config_p)
+                                     distributed::StorageConfig storage_config_p)
     : server_url(std::move(server_url_p)) {
 	client = make_uniq<DistributedFlightClient>(server_url, role_p, std::move(storage_config_p));
 	auto status = client->Connect();

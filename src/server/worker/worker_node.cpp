@@ -1,5 +1,6 @@
 #include "server/worker/worker_node.hpp"
 
+#include "client.pb.h"
 #include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
@@ -23,7 +24,7 @@
 namespace duckdb {
 
 WorkerNode::WorkerNode(string worker_id_p, string host_p, int port_p, DuckDB *shared_db,
-                       const StorageConfig &storage_config)
+                       const distributed::StorageConfig &storage_config)
     : worker_id(std::move(worker_id_p)), host(std::move(host_p)), port(port_p) {
 	if (shared_db != nullptr) {
 		db = shared_db;

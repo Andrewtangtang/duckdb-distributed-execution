@@ -1,5 +1,6 @@
 #include "server/driver/query_utils.hpp"
 
+#include "client.pb.h"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/file_system.hpp"
@@ -15,30 +16,10 @@
 
 namespace duckdb {
 
-StorageConfig GetStorageConfig(int argc, char *argv[]) {
-	if (argc > 8) {
-		throw InvalidInputException(
-		    "Expected [database_uri] [backend] [root] [bucket] after host, port, and worker arguments");
-	}
-	StorageConfig config;
-	if (argc > 4) {
-		config.database_uri = argv[4];
-	}
-	if (argc > 5) {
-		config.backend = argv[5];
-	}
-	if (argc > 6) {
-		config.root = argv[6];
-	}
-	if (argc > 7) {
-		config.bucket = argv[7];
-	}
-	return config;
-}
-
-void InitializeStorage(Connection &conn, const StorageConfig &config) {
-	if (config.database_uri.empty()) {
-		if (!config.root.empty() || !config.bucket.empty() || config.backend != "local") {
+void InitializeStorage(Connection &conn, const distributed::StorageConfig &config) {
+	const auto backend = config.backend().empty() ? "local" : config.backend();
+	if (config.database_uri().empty()) {
+		if (!config.root().empty() || !config.bucket().empty() || backend != "local") {
 			throw InvalidInputException("Storage settings require a database path or URI");
 		}
 		return;
@@ -47,7 +28,8 @@ void InitializeStorage(Connection &conn, const StorageConfig &config) {
 	auto existing = DatabaseManager::Get(*conn.context).GetDatabase("object_db");
 	if (existing) {
 		auto &fs = FileSystem::GetFileSystem(*conn.context);
-		if (existing->GetCatalog().GetDBPath() != fs.CanonicalizePath(config.database_uri) || !existing->IsReadOnly()) {
+		if (existing->GetCatalog().GetDBPath() != fs.CanonicalizePath(config.database_uri()) ||
+		    !existing->IsReadOnly()) {
 			throw InvalidInputException("object_db is already attached to a different database or access mode");
 		}
 	}
@@ -58,42 +40,42 @@ void InitializeStorage(Connection &conn, const StorageConfig &config) {
 			throw IOException("Storage initialization failed: %s", result->GetError());
 		}
 	};
-	if (!StringUtil::StartsWith(config.database_uri, "duckdb_objfs://")) {
-		if (config.database_uri.find("://") != string::npos || config.backend != "local" || !config.root.empty() ||
-		    !config.bucket.empty()) {
+	if (!StringUtil::StartsWith(config.database_uri(), "duckdb_objfs://")) {
+		if (config.database_uri().find("://") != string::npos || backend != "local" || !config.root().empty() ||
+		    !config.bucket().empty()) {
 			throw InvalidInputException("Native database files do not accept object storage settings or URI schemes");
 		}
 		execute(StringUtil::Format("ATTACH IF NOT EXISTS %s AS object_db (READ_ONLY)",
-		                           KeywordHelper::WriteQuoted(config.database_uri)));
+		                           KeywordHelper::WriteQuoted(config.database_uri())));
 		return;
 	}
-	if (config.database_uri == "duckdb_objfs://") {
+	if (config.database_uri() == "duckdb_objfs://") {
 		throw InvalidInputException("Object storage database URI must name a database");
 	}
-	if (config.backend != "local" && config.backend != "s3") {
+	if (backend != "local" && backend != "s3") {
 		throw InvalidInputException("Object storage backend must be local or s3");
 	}
-	if (config.backend == "local" && (config.root.empty() || !config.bucket.empty())) {
+	if (backend == "local" && (config.root().empty() || !config.bucket().empty())) {
 		throw InvalidInputException("Local object storage requires a root and does not accept a bucket");
 	}
-	if (config.backend == "s3" && config.bucket.empty()) {
+	if (backend == "s3" && config.bucket().empty()) {
 		throw InvalidInputException("S3 object storage requires a bucket");
 	}
 	execute("LOAD duckdb_object_storage");
-	execute(StringUtil::Format("SET duckdb_objfs_backend = %s", KeywordHelper::WriteQuoted(config.backend)));
-	if (!config.root.empty()) {
-		execute(StringUtil::Format("SET duckdb_objfs_root = %s", KeywordHelper::WriteQuoted(config.root)));
+	execute(StringUtil::Format("SET duckdb_objfs_backend = %s", KeywordHelper::WriteQuoted(backend)));
+	if (!config.root().empty()) {
+		execute(StringUtil::Format("SET duckdb_objfs_root = %s", KeywordHelper::WriteQuoted(config.root())));
 	}
-	if (config.backend == "s3") {
+	if (backend == "s3") {
 		execute("LOAD cache_httpfs");
 		// Credentials are resolved locally, never sent in worker registration requests.
 		execute(StringUtil::Format(
 		    "CREATE SECRET IF NOT EXISTS duckherder_objfs (TYPE S3, PROVIDER credential_chain, SCOPE %s)",
-		    KeywordHelper::WriteQuoted(StringUtil::Format("s3://%s/", config.bucket))));
-		execute(StringUtil::Format("SET duckdb_objfs_bucket = %s", KeywordHelper::WriteQuoted(config.bucket)));
+		    KeywordHelper::WriteQuoted(StringUtil::Format("s3://%s/", config.bucket()))));
+		execute(StringUtil::Format("SET duckdb_objfs_bucket = %s", KeywordHelper::WriteQuoted(config.bucket())));
 	}
 	execute(StringUtil::Format("ATTACH IF NOT EXISTS %s AS object_db (READ_ONLY)",
-	                           KeywordHelper::WriteQuoted(config.database_uri)));
+	                           KeywordHelper::WriteQuoted(config.database_uri())));
 }
 
 bool ContainsTableScan(const PhysicalOperator &op) {

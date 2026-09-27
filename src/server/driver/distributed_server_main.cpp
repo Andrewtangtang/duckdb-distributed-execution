@@ -9,16 +9,14 @@
  * - Optionally starts local worker nodes for single-machine distributed execution
  *
  * Usage:
- *   ./distributed_server [host] [port] [num_workers] [database_uri] [backend] [root] [bucket]
+ *   ./distributed_server [host] [port] [num_workers]
  *
  * Arguments:
  *   host         - Host address to bind to (default: 0.0.0.0)
  *   port         - Port to listen on (default: 8815)
  *   num_workers  - Number of local workers to start (default: 0 = no distributed execution)
- *   database_uri - Optional native file or duckdb_objfs:// URI attached read-only as object_db
- *   backend      - local (default) or s3
- *   root         - ObjFS local storage directory or optional S3 key prefix
- *   bucket       - Required for s3; omit for local
+ *
+ * Storage settings are supplied by clients during registration.
  *
  * Examples:
  *   ./distributed_server                          # Start on 0.0.0.0:8815 with no workers (local mode)
@@ -33,7 +31,6 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "server/driver/distributed_flight_server.hpp"
-#include "server/driver/query_utils.hpp"
 
 using namespace duckdb;
 
@@ -74,8 +71,13 @@ int main(int argc, char *argv[]) {
 	signal(SIGTERM, SignalHandler);
 
 	try {
+		if (argc > 4) {
+			std::cerr << "Expected [host] [port] [num_workers]; storage settings belong to client registration"
+			          << std::endl;
+			return 1;
+		}
 		// Create and start Flight server.
-		g_server = std::make_unique<DistributedFlightServer>(host, port, GetStorageConfig(argc, argv));
+		g_server = std::make_unique<DistributedFlightServer>(host, port);
 
 		auto LogServerError = [&](const string &message) {
 			if (g_server) {

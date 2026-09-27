@@ -1,7 +1,7 @@
 #pragma once
 
 #include "base_query_recorder.hpp"
-#include "distributed.pb.h"
+#include "client.pb.h"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/duck_catalog.hpp"
 #include "duckdb/common/mutex.hpp"
@@ -11,7 +11,6 @@
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/planner/logical_operator.hpp"
-#include "storage_config.hpp"
 
 namespace duckdb {
 
@@ -35,8 +34,8 @@ struct RemoteTableConfig {
 
 class DuckherderCatalog : public DuckCatalog {
 public:
-	DuckherderCatalog(AttachedDatabase &db, string server_host_p, int server_port_p, StorageConfig storage_config_p,
-	                  distributed::ClientRole role_p);
+	DuckherderCatalog(AttachedDatabase &db, string server_host_p, int server_port_p,
+	                  distributed::StorageConfig storage_config_p, distributed::ClientRole role_p);
 
 	~DuckherderCatalog() override;
 

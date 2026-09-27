@@ -1,5 +1,6 @@
 #include "duckherder_catalog.hpp"
 
+#include "client.pb.h"
 #include "client/execution/distributed_client.hpp"
 #include "client/execution/logical_remote_create_index.hpp"
 #include "client/execution/remote_dml.hpp"
@@ -27,7 +28,7 @@
 namespace duckdb {
 
 DuckherderCatalog::DuckherderCatalog(AttachedDatabase &db, string server_host_p, int server_port_p,
-                                     StorageConfig storage_config_p, distributed::ClientRole role_p)
+                                     distributed::StorageConfig storage_config_p, distributed::ClientRole role_p)
     : DuckCatalog(db), duckdb_catalog(make_uniq<DuckCatalog>(db)), db_instance(db.GetDatabase()),
       server_host(std::move(server_host_p)), server_port(server_port_p) {
 	distributed_client = make_uniq<DistributedClient>(GetServerUrl(), role_p, std::move(storage_config_p));

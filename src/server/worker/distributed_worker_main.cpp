@@ -35,9 +35,9 @@
 #include <iostream>
 #include <memory>
 
+#include "client.pb.h"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/logging/logger.hpp"
-#include "server/driver/query_utils.hpp"
 #include "server/worker/worker_node.hpp"
 
 using namespace duckdb;
@@ -79,9 +79,26 @@ int main(int argc, char *argv[]) {
 	signal(SIGTERM, SignalHandler);
 
 	try {
+		if (argc > 8) {
+			std::cerr << "Expected [host] [port] [worker_id] [database_uri] [backend] [root] [bucket]" << std::endl;
+			return 1;
+		}
+		distributed::StorageConfig storage_config;
+		if (argc > 4) {
+			storage_config.set_database_uri(argv[4]);
+		}
+		if (argc > 5) {
+			storage_config.set_backend(argv[5]);
+		}
+		if (argc > 6) {
+			storage_config.set_root(argv[6]);
+		}
+		if (argc > 7) {
+			storage_config.set_bucket(argv[7]);
+		}
 		// Create and start worker node.
 		// Pass nullptr for shared_db to create an independent database instance.
-		g_worker = std::make_unique<WorkerNode>(worker_id, host, port, nullptr, GetStorageConfig(argc, argv));
+		g_worker = std::make_unique<WorkerNode>(worker_id, host, port, nullptr, storage_config);
 
 		auto status = g_worker->Start();
 		if (!status.ok()) {

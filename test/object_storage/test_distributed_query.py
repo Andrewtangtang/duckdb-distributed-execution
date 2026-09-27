@@ -45,10 +45,11 @@ def main():
         work = Path(directory)
         subprocess.run(
             [args.protoc, f"-I{ROOT / 'src/proto'}", f"--python_out={work}",
-             str(ROOT / "src/proto/distributed.proto")], check=True,
+             *map(str, sorted((ROOT / "src/proto").glob("*.proto")))], check=True,
         )
         sys.path.insert(0, str(work))
         proto = importlib.import_module("distributed_pb2")
+        client_proto = importlib.import_module("client_pb2")
         client_ids = {}
 
         def action(client, request, expect_success=True):
@@ -76,10 +77,10 @@ def main():
             client = flight.FlightClient(("127.0.0.1", port))
             request = proto.DistributedRequest()
             if role == "server":
-                request.register_client.role = proto.CLIENT_ROLE_READ_WRITE
-                for field, value in zip(("database_uri", "storage_backend", "storage_root", "storage_bucket"),
+                request.register_client.role = client_proto.CLIENT_ROLE_READ_WRITE
+                for field, value in zip(("database_uri", "backend", "root", "bucket"),
                                         client_storage_args):
-                    setattr(request.register_client, field, value)
+                    setattr(request.register_client.storage_config, field, value)
             else:
                 request.worker_heartbeat.worker_id = "readiness"
             try:
@@ -134,22 +135,41 @@ def main():
                 (*storage_args, "unexpected-bucket"),
                 (*storage_args, "bucket", "extra-argument"),
             ]
-            for role in ("server", "worker"):
-                for config in invalid_configs:
-                    result = subprocess.run(
-                        [str(binaries / f"distributed_{role}"), "127.0.0.1", str(free_port()),
-                         "0" if role == "server" else "bad-worker", *config],
-                        capture_output=True, text=True, timeout=30,
-                    )
-                    assert result.returncode != 0, (role, config, result.stdout)
-                    assert "started successfully" not in result.stdout
+            for config in invalid_configs:
+                result = subprocess.run(
+                    [str(binaries / "distributed_worker"), "127.0.0.1", str(free_port()), "bad-worker", *config],
+                    capture_output=True, text=True, timeout=30,
+                )
+                assert result.returncode != 0, (config, result.stdout)
+                assert "started successfully" not in result.stdout
 
             # Omitting the optional argument preserves the original startup behavior.
             default_driver, _ = start("server")
             assert query(default_driver, "SELECT 42 AS answer").to_pylist() == [{"answer": 42}]
             start("worker")
 
-            # Native files use the same startup hook without loading ObjFS.
+            # Invalid client storage settings must leave the running driver usable.
+            for config in invalid_configs[:-1]:
+                request = proto.DistributedRequest()
+                request.register_client.role = client_proto.CLIENT_ROLE_READ_ONLY
+                for field, value in zip(("database_uri", "backend", "root", "bucket"), config):
+                    setattr(request.register_client.storage_config, field, value)
+                try:
+                    action(default_driver, request)
+                    raise AssertionError("Invalid client storage configuration was accepted")
+                except (flight.FlightError, pa.ArrowInvalid):
+                    pass
+            assert query(default_driver, "SELECT 42 AS answer").to_pylist() == [{"answer": 42}]
+
+            # Driver storage arguments are replaced by client registration settings.
+            result = subprocess.run(
+                [str(binaries / "distributed_server"), "127.0.0.1", str(free_port()), "0", *storage_args],
+                capture_output=True, text=True, timeout=30,
+            )
+            assert result.returncode != 0
+            assert "client registration" in result.stderr
+
+            # Native files use client registration on the driver and the startup hook on workers.
             native_path = work / "native's database.db"
             subprocess.run([str(duckdb), str(native_path), "-bail"],
                            input="CREATE TABLE items AS SELECT i FROM range(3) t(i);",
@@ -157,11 +177,11 @@ def main():
             # An existing alias must not hide a request for another database.
             collision_driver, _ = start("server")
             request = proto.DistributedRequest()
-            request.execute_sql.sql = f"ATTACH {sql_string(native_path)} AS object_db (READ_ONLY)"
+            request.execute_statement.sql = f"ATTACH {sql_string(native_path)} AS object_db (READ_ONLY)"
             action(collision_driver, request)
             request = proto.DistributedRequest()
-            request.register_client.role = proto.CLIENT_ROLE_READ_ONLY
-            request.register_client.database_uri = str(native_path) + ".missing"
+            request.register_client.role = client_proto.CLIENT_ROLE_READ_ONLY
+            request.register_client.storage_config.database_uri = str(native_path) + ".missing"
             try:
                 action(collision_driver, request)
                 raise AssertionError("An existing alias hid a different requested database")
@@ -172,8 +192,7 @@ def main():
             dynamic_native, _ = start("server", client_storage_args=(str(native_path),))
             assert query(dynamic_native, "SELECT i FROM items ORDER BY i")["i"].to_pylist() == [0, 1, 2]
 
-            native_driver, _ = start("server", (str(native_path),))
-            assert query(native_driver, "SELECT i FROM object_db.items ORDER BY i")["i"].to_pylist() == [0, 1, 2]
+            assert query(dynamic_native, "SELECT i FROM object_db.items ORDER BY i")["i"].to_pylist() == [0, 1, 2]
             native_worker, _ = start("worker", (str(native_path),))
             request = proto.DistributedRequest()
             request.execute_partition.sql = "SELECT i FROM object_db.items ORDER BY i"
@@ -191,29 +210,29 @@ def main():
             dynamic_driver, _ = start("server", client_storage_args=storage_args)
             assert query(dynamic_driver, "SELECT i FROM items ORDER BY i")["i"].to_pylist() == [0, 1, 2]
             request = proto.DistributedRequest()
-            request.register_client.role = proto.CLIENT_ROLE_READ_ONLY
-            request.register_client.database_uri = storage_args[0]
-            request.register_client.storage_backend = storage_args[1]
-            request.register_client.storage_root = storage_args[2]
+            request.register_client.role = client_proto.CLIENT_ROLE_READ_ONLY
+            request.register_client.storage_config.database_uri = storage_args[0]
+            request.register_client.storage_config.backend = storage_args[1]
+            request.register_client.storage_config.root = storage_args[2]
             dynamic_reader_id = action(dynamic_driver, request).register_client.client_id
             assert query(dynamic_driver, "SELECT i FROM items ORDER BY i", dynamic_reader_id)["i"].to_pylist() == [0, 1, 2]
             request = proto.DistributedRequest()
-            request.register_client.role = proto.CLIENT_ROLE_READ_ONLY
-            request.register_client.database_uri = "duckdb_objfs://different.db"
-            request.register_client.storage_backend = storage_args[1]
-            request.register_client.storage_root = storage_args[2]
+            request.register_client.role = client_proto.CLIENT_ROLE_READ_ONLY
+            request.register_client.storage_config.database_uri = "duckdb_objfs://different.db"
+            request.register_client.storage_config.backend = storage_args[1]
+            request.register_client.storage_config.root = storage_args[2]
             response = action(dynamic_driver, request, expect_success=False)
             assert "different storage attachment" in response.error_message
             assert query(dynamic_driver, "SELECT i FROM items ORDER BY i")["i"].to_pylist() == [0, 1, 2]
 
-            driver, _ = start("server", storage_args)
+            driver, _ = start("server", client_storage_args=storage_args)
 
             # Cluster changes follow the control node's existing writable-client policy.
             request = proto.DistributedRequest()
-            request.register_client.role = proto.CLIENT_ROLE_READ_ONLY
+            request.register_client.role = client_proto.CLIENT_ROLE_READ_ONLY
             reader_id = action(driver, request).register_client.client_id
             assert reader_id
-            # Reader sessions can use the database attached during instance initialization.
+            # Reader sessions without storage options reuse the instance's client-selected database.
             assert query(driver, "SELECT i FROM object_db.items ORDER BY i", reader_id)["i"].to_pylist() == [0, 1, 2]
             for client_id, expected_error in (("unknown-client", "not registered"), (reader_id, "read-only")):
                 request = proto.DistributedRequest()
@@ -227,7 +246,7 @@ def main():
             # Query before worker registration keeps this check independent of partition changes.
             assert query(driver, "SELECT i FROM object_db.items ORDER BY i")["i"].to_pylist() == [0, 1, 2]
             request = proto.DistributedRequest()
-            request.execute_sql.sql = "INSERT INTO object_db.items VALUES (3)"
+            request.execute_statement.sql = "INSERT INTO object_db.items VALUES (3)"
             response = action(driver, request, expect_success=False)
             assert "read-only" in response.error_message.lower()
             for index in range(2):

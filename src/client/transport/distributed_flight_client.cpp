@@ -1,5 +1,6 @@
 #include "client/transport/distributed_flight_client.hpp"
 
+#include "client.pb.h"
 #include "duckdb/common/assert.hpp"
 #include "duckdb/common/string_util.hpp"
 
@@ -8,7 +9,7 @@
 namespace duckdb {
 
 DistributedFlightClient::DistributedFlightClient(string server_url_p, distributed::ClientRole role_p,
-                                                 StorageConfig storage_config_p)
+                                                 distributed::StorageConfig storage_config_p)
     : server_url(std::move(server_url_p)), role(role_p), storage_config(std::move(storage_config_p)) {
 }
 
@@ -45,10 +46,7 @@ arrow::Status DistributedFlightClient::RegisterClient() {
 	distributed::DistributedRequest req;
 	auto &registration = *req.mutable_register_client();
 	registration.set_role(role);
-	registration.set_database_uri(storage_config.database_uri);
-	registration.set_storage_backend(storage_config.backend);
-	registration.set_storage_root(storage_config.root);
-	registration.set_storage_bucket(storage_config.bucket);
+	*registration.mutable_storage_config() = storage_config;
 
 	distributed::DistributedResponse response;
 	ARROW_RETURN_NOT_OK(SendAction(req, response));

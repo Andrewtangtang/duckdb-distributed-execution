@@ -1,5 +1,6 @@
 #pragma once
 
+#include "client.pb.h"
 #include "distributed.pb.h"
 #include "duckdb.hpp"
 #include "duckdb/common/atomic.hpp"
@@ -10,7 +11,6 @@
 #include "server/driver/distributed_executor.hpp"
 #include "server/driver/query_plan_analyzer.hpp"
 #include "server/driver/worker_manager.hpp"
-#include "storage_config.hpp"
 
 #include <arrow/flight/api.h>
 #include <arrow/record_batch.h>
@@ -47,7 +47,7 @@ struct QueryExecutionInfo {
 // Arrow Flight-based RPC server for distributed execution.
 class DistributedFlightServer : public arrow::flight::FlightServerBase {
 public:
-	explicit DistributedFlightServer(string host_p = "0.0.0.0", int port_p = 8815, StorageConfig storage_config_p = {});
+	explicit DistributedFlightServer(string host_p = "0.0.0.0", int port_p = 8815);
 	~DistributedFlightServer() override = default;
 
 	// Start the server.
@@ -103,7 +103,7 @@ public:
 private:
 	struct ClientRegistration {
 		ClientRegistration(DuckDB &db, WorkerManager &worker_manager, distributed::ClientRole role_p,
-		                   const StorageConfig &storage_config);
+		                   const distributed::StorageConfig &storage_config);
 
 		distributed::ClientRole role;
 		// Last authorized request time in steady-clock milliseconds, updated concurrently by RPC handlers.
@@ -171,7 +171,7 @@ private:
 	                     shared_ptr<ClientRegistration> &registration, distributed::DistributedResponse &resp);
 	string host;
 	int port;
-	StorageConfig storage_config;
+	distributed::StorageConfig storage_config;
 	unique_ptr<DuckDB> db;
 	unique_ptr<WorkerManager> worker_manager;
 

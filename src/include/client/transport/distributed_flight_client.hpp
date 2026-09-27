@@ -2,13 +2,14 @@
 
 #pragma once
 
+#include "client.pb.h"
 #include "distributed.pb.h"
 #include "duckdb/common/atomic.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/string.hpp"
 #include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/main/query_result.hpp"
-#include "storage_config.hpp"
+#include "transaction.pb.h"
 
 #include <arrow/flight/api.h>
 #include <arrow/record_batch.h>
@@ -21,7 +22,8 @@ namespace duckdb {
 
 class DistributedFlightClient {
 public:
-	DistributedFlightClient(string server_url_p, distributed::ClientRole role_p, StorageConfig storage_config_p = {});
+	DistributedFlightClient(string server_url_p, distributed::ClientRole role_p,
+	                        distributed::StorageConfig storage_config_p);
 	~DistributedFlightClient();
 
 	// Connect to server.
@@ -64,7 +66,7 @@ private:
 private:
 	string server_url;
 	distributed::ClientRole role;
-	StorageConfig storage_config;
+	distributed::StorageConfig storage_config;
 	string client_id;
 	arrow::flight::Location location;
 	std::unique_ptr<arrow::flight::FlightClient> client;

@@ -1,14 +1,20 @@
 #include "catch/catch.hpp"
 
+#include "client.pb.h"
+#include "client/execution/distributed_client.hpp"
 #include "client/transport/distributed_flight_client.hpp"
 #include "distributed.pb.h"
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/types/uuid.hpp"
+#include "duckdb/main/attached_database.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
+#include "duckherder_catalog.hpp"
 #include "duckherder_extension.hpp"
 #include "server/driver/distributed_flight_server.hpp"
-#include "storage_config.hpp"
 #include "utils/network_utils.hpp"
 
 #include <chrono>
@@ -85,7 +91,7 @@ uint64_t CountRows(DistributedFlightClient &client, const string &table_name) {
 
 TEST_CASE("Test Flight server startup and connection", "[distributed_flight]") {
 	GetTestServer();
-	DistributedFlightClient client(SERVER_URL, distributed::CLIENT_ROLE_READ_WRITE);
+	DistributedFlightClient client(SERVER_URL, distributed::CLIENT_ROLE_READ_WRITE, {});
 	auto status = client.Connect();
 
 	REQUIRE(status.ok());
@@ -103,22 +109,22 @@ TEST_CASE("Expired writer lease can be reclaimed", "[distributed_flight]") {
 	} timeout_reset(server);
 
 	server.SetClientLeaseTimeoutForTesting(std::chrono::milliseconds(1));
-	DistributedFlightClient expired_writer(SERVER_URL, distributed::CLIENT_ROLE_READ_WRITE);
+	DistributedFlightClient expired_writer(SERVER_URL, distributed::CLIENT_ROLE_READ_WRITE, {});
 	REQUIRE(expired_writer.Connect().ok());
 	std::this_thread::sleep_for(std::chrono::milliseconds(20));
 
-	DistributedFlightClient replacement_writer(SERVER_URL, distributed::CLIENT_ROLE_READ_WRITE);
+	DistributedFlightClient replacement_writer(SERVER_URL, distributed::CLIENT_ROLE_READ_WRITE, {});
 	REQUIRE(replacement_writer.Connect().ok());
 }
 
 TEST_CASE("Server reset clears writer admission", "[distributed_flight]") {
 	auto &server = GetTestServer().GetServer();
-	DistributedFlightClient old_writer(SERVER_URL, distributed::CLIENT_ROLE_READ_WRITE);
+	DistributedFlightClient old_writer(SERVER_URL, distributed::CLIENT_ROLE_READ_WRITE, {});
 	REQUIRE(old_writer.Connect().ok());
 
 	server.Reset();
 
-	DistributedFlightClient replacement_writer(SERVER_URL, distributed::CLIENT_ROLE_READ_WRITE);
+	DistributedFlightClient replacement_writer(SERVER_URL, distributed::CLIENT_ROLE_READ_WRITE, {});
 	REQUIRE(replacement_writer.Connect().ok());
 
 	bool exists = false;
@@ -127,8 +133,8 @@ TEST_CASE("Server reset clears writer admission", "[distributed_flight]") {
 
 TEST_CASE("Each client owns an isolated DuckDB connection", "[distributed_flight]") {
 	GetTestServer();
-	DistributedFlightClient writer(SERVER_URL, distributed::CLIENT_ROLE_READ_WRITE);
-	DistributedFlightClient reader(SERVER_URL, distributed::CLIENT_ROLE_READ_ONLY);
+	DistributedFlightClient writer(SERVER_URL, distributed::CLIENT_ROLE_READ_WRITE, {});
+	DistributedFlightClient reader(SERVER_URL, distributed::CLIENT_ROLE_READ_ONLY, {});
 	REQUIRE(writer.Connect().ok());
 	REQUIRE(reader.Connect().ok());
 
@@ -146,7 +152,7 @@ TEST_CASE("Each client owns an isolated DuckDB connection", "[distributed_flight
 
 	// Closing the writer destroys its server-side connection and rolls back the open transaction.
 	writer.Close();
-	DistributedFlightClient replacement_writer(SERVER_URL, distributed::CLIENT_ROLE_READ_WRITE);
+	DistributedFlightClient replacement_writer(SERVER_URL, distributed::CLIENT_ROLE_READ_WRITE, {});
 	REQUIRE(replacement_writer.Connect().ok());
 	REQUIRE(CountRows(replacement_writer, "client_connection_isolation") == 1);
 
@@ -158,7 +164,7 @@ TEST_CASE("Each client owns an isolated DuckDB connection", "[distributed_flight
 
 TEST_CASE("Test TableExists via protobuf", "[distributed_flight]") {
 	GetTestServer();
-	DistributedFlightClient client(SERVER_URL, distributed::CLIENT_ROLE_READ_WRITE);
+	DistributedFlightClient client(SERVER_URL, distributed::CLIENT_ROLE_READ_WRITE, {});
 	REQUIRE(client.Connect().ok());
 
 	distributed::DistributedResponse create_resp;
@@ -179,7 +185,7 @@ TEST_CASE("Test TableExists via protobuf", "[distributed_flight]") {
 
 TEST_CASE("Test error handling in protobuf responses", "[distributed_flight]") {
 	GetTestServer();
-	DistributedFlightClient client(SERVER_URL, distributed::CLIENT_ROLE_READ_WRITE);
+	DistributedFlightClient client(SERVER_URL, distributed::CLIENT_ROLE_READ_WRITE, {});
 	REQUIRE(client.Connect().ok());
 
 	distributed::DistributedResponse response;
@@ -225,22 +231,24 @@ TEST_CASE("Client ATTACH initializes storage on a running driver", "[distributed
 	                port, KeywordHelper::WriteQuoted(StringUtil::Format("%s.missing", database.path.string()))))
 	            ->HasError());
 	REQUIRE_FALSE(connection.Query(attach_sql)->HasError());
-	// Remote catalog discovery is not implemented; register the existing table's local metadata.
-	REQUIRE_FALSE(connection.Query("CREATE TABLE dh.items (i BIGINT)")->HasError());
-	REQUIRE_FALSE(connection.Query("PRAGMA duckherder_register_remote_table('items', 'items')")->HasError());
-	auto rows = connection.Query("SELECT i FROM dh.items ORDER BY i");
+	// Remote catalog discovery is not implemented; query through the attached catalog's client.
+	auto &catalog = DatabaseManager::Get(*connection.context).GetDatabase("dh")->GetCatalog().Cast<DuckherderCatalog>();
+	auto rows = catalog.GetClient().ScanTable("items");
 	INFO((rows->HasError() ? rows->GetError() : ""));
 	REQUIRE_FALSE(rows->HasError());
-	REQUIRE(rows->GetValue(0, 0).GetValue<int64_t>() == 0);
-	REQUIRE(rows->GetValue(0, 2).GetValue<int64_t>() == 2);
+	auto chunk = rows->Fetch();
+	REQUIRE(chunk);
+	REQUIRE(chunk->size() == 3);
+	REQUIRE(chunk->GetValue(0, 0).GetValue<int64_t>() == 0);
+	REQUIRE(chunk->GetValue(0, 2).GetValue<int64_t>() == 2);
 
-	StorageConfig config;
-	config.database_uri = database.path.string();
+	distributed::StorageConfig config;
+	config.set_database_uri(database.path.string());
 	DistributedFlightClient reader(StringUtil::Format("grpc://localhost:%d", port), distributed::CLIENT_ROLE_READ_ONLY,
 	                               config);
 	REQUIRE(reader.Connect().ok());
 	REQUIRE(CountRows(reader, "items") == 3);
-	config.database_uri += ".different";
+	config.set_database_uri(StringUtil::Format("%s.different", database.path.string()));
 	DistributedFlightClient conflicting_reader(StringUtil::Format("grpc://localhost:%d", port),
 	                                           distributed::CLIENT_ROLE_READ_ONLY, config);
 	REQUIRE_FALSE(conflicting_reader.Connect().ok());
