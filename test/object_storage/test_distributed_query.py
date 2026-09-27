@@ -98,9 +98,9 @@ def main():
             request.worker_register.port = port
             assert action(client, request).worker_register.accepted
 
-        def query(client, sql):
+        def query(client, sql, client_id=None):
             request = proto.DistributedRequest()
-            request.client_id = client_ids[client]
+            request.client_id = client_id or client_ids[client]
             request.scan_table.table_name = sql
             request.scan_table.limit = (1 << 64) - 1
             return client.do_get(flight.Ticket(request.SerializeToString()), options=OPTIONS).read_all()
@@ -174,6 +174,8 @@ def main():
             request.register_client.role = proto.CLIENT_ROLE_READ_ONLY
             reader_id = action(driver, request).register_client.client_id
             assert reader_id
+            # Reader sessions can use the database attached during instance initialization.
+            assert query(driver, "SELECT i FROM object_db.items ORDER BY i", reader_id)["i"].to_pylist() == [0, 1, 2]
             for client_id, expected_error in (("unknown-client", "not registered"), (reader_id, "read-only")):
                 request = proto.DistributedRequest()
                 request.client_id = client_id
