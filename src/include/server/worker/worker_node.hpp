@@ -4,7 +4,7 @@
 #include "duckdb.hpp"
 #include "duckdb/common/string.hpp"
 #include "duckdb/common/unique_ptr.hpp"
-#include "server/driver/query_utils.hpp"
+#include "storage_config.hpp"
 
 #include <arrow/flight/api.h>
 #include <memory>

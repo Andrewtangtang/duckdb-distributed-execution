@@ -11,6 +11,7 @@
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/planner/logical_operator.hpp"
+#include "storage_config.hpp"
 
 namespace duckdb {
 
@@ -34,7 +35,7 @@ struct RemoteTableConfig {
 
 class DuckherderCatalog : public DuckCatalog {
 public:
-	DuckherderCatalog(AttachedDatabase &db, string server_host_p, int server_port_p, string server_db_path_p,
+	DuckherderCatalog(AttachedDatabase &db, string server_host_p, int server_port_p, StorageConfig storage_config_p,
 	                  distributed::ClientRole role_p);
 
 	~DuckherderCatalog() override;
@@ -113,7 +114,6 @@ private:
 	// Server configuration.
 	string server_host;
 	int server_port;
-	string server_db_path;
 
 	// Remote table configuration.
 	// TODO(hjiang): Currently remote tables lives in memory, should provide options to persist and load.

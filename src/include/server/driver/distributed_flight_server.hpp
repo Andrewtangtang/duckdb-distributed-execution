@@ -5,12 +5,12 @@
 #include "duckdb/common/atomic.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/string.hpp"
-#include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/unique_ptr.hpp"
+#include "duckdb/common/unordered_map.hpp"
 #include "server/driver/distributed_executor.hpp"
 #include "server/driver/query_plan_analyzer.hpp"
-#include "server/driver/query_utils.hpp"
 #include "server/driver/worker_manager.hpp"
+#include "storage_config.hpp"
 
 #include <arrow/flight/api.h>
 #include <arrow/record_batch.h>
@@ -102,7 +102,8 @@ public:
 
 private:
 	struct ClientRegistration {
-		ClientRegistration(DuckDB &db, WorkerManager &worker_manager, distributed::ClientRole role_p);
+		ClientRegistration(DuckDB &db, WorkerManager &worker_manager, distributed::ClientRole role_p,
+		                   const StorageConfig &storage_config);
 
 		distributed::ClientRole role;
 		// Last authorized request time in steady-clock milliseconds, updated concurrently by RPC handlers.

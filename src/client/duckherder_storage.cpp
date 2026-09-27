@@ -5,6 +5,7 @@
 #include "duckdb/main/attached_database.hpp"
 #include "duckherder_catalog.hpp"
 #include "duckherder_transaction_manager.hpp"
+#include "storage_config.hpp"
 
 namespace duckdb {
 
@@ -18,7 +19,7 @@ unique_ptr<Catalog> DuckherderAttach(optional_ptr<StorageExtensionInfo> storage_
 	// Extract server configuration from ATTACH DATABASE options.
 	string server_host = "localhost";
 	int server_port = 8815;
-	string server_db_path;
+	StorageConfig storage_config;
 	const bool attach_read_only = options.access_mode == AccessMode::READ_ONLY;
 	auto role = attach_read_only ? distributed::CLIENT_ROLE_READ_ONLY : distributed::CLIENT_ROLE_READ_WRITE;
 
@@ -34,7 +35,20 @@ unique_ptr<Catalog> DuckherderAttach(optional_ptr<StorageExtensionInfo> storage_
 
 	it = options.options.find("server_db_path");
 	if (it != options.options.end()) {
-		server_db_path = it->second.ToString();
+		storage_config.database_uri = it->second.ToString();
+	}
+
+	it = options.options.find("storage_backend");
+	if (it != options.options.end()) {
+		storage_config.backend = it->second.ToString();
+	}
+	it = options.options.find("storage_root");
+	if (it != options.options.end()) {
+		storage_config.root = it->second.ToString();
+	}
+	it = options.options.find("storage_bucket");
+	if (it != options.options.end()) {
+		storage_config.bucket = it->second.ToString();
 	}
 
 	it = options.options.find("client_role");
@@ -56,9 +70,12 @@ unique_ptr<Catalog> DuckherderAttach(optional_ptr<StorageExtensionInfo> storage_
 	options.options.erase("server_host");
 	options.options.erase("server_port");
 	options.options.erase("server_db_path");
+	options.options.erase("storage_backend");
+	options.options.erase("storage_root");
+	options.options.erase("storage_bucket");
 	options.options.erase("client_role");
 
-	return make_uniq<DuckherderCatalog>(db, std::move(server_host), server_port, std::move(server_db_path), role);
+	return make_uniq<DuckherderCatalog>(db, std::move(server_host), server_port, std::move(storage_config), role);
 }
 
 } // namespace

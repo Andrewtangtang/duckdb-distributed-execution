@@ -11,6 +11,11 @@ enum ClientRole {
 // Register a Duckherder attachment with the control node.
 message RegisterClientRequest {
   ClientRole role = 1;
+  // Optional database attachment initialized on the control node for this session.
+  string database_uri = 2;
+  string storage_backend = 3;
+  string storage_root = 4;
+  string storage_bucket = 5;
 }
 
 message UnregisterClientRequest {}

@@ -2,10 +2,19 @@
 
 #include "client/distributed_flight_client.hpp"
 #include "distributed.pb.h"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/uuid.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
+#include "duckherder_extension.hpp"
 #include "server/driver/distributed_flight_server.hpp"
+#include "storage_config.hpp"
+#include "utils/network_utils.hpp"
 
 #include <chrono>
+#include <filesystem>
 #include <iostream>
+#include <system_error>
 #include <thread>
 
 using namespace duckdb; // NOLINT
@@ -18,7 +27,8 @@ const std::string SERVER_URL = "grpc://localhost:18815";
 
 class FlightTestServer {
 public:
-	FlightTestServer() : server(std::make_unique<DistributedFlightServer>(SERVER_HOST, SERVER_PORT)) {
+	explicit FlightTestServer(int port = SERVER_PORT)
+	    : server(std::make_unique<DistributedFlightServer>(SERVER_HOST, port)) {
 		auto status = server->Start();
 		if (!status.ok()) {
 			throw std::runtime_error("Failed to start server: " + status.ToString());
@@ -177,4 +187,61 @@ TEST_CASE("Test error handling in protobuf responses", "[distributed_flight]") {
 	REQUIRE(status.ok());
 	REQUIRE_FALSE(response.success());
 	REQUIRE_FALSE(response.error_message().empty());
+}
+
+TEST_CASE("Client ATTACH initializes storage on a running driver", "[distributed_flight]") {
+	struct TemporaryDatabase {
+		std::filesystem::path path =
+		    std::filesystem::temp_directory_path() /
+		    StringUtil::Format("duckherder's-%s.db", UUID::ToString(UUID::GenerateRandomUUID()));
+		~TemporaryDatabase() {
+			std::error_code error;
+			std::filesystem::remove(path, error);
+		}
+	} database;
+	{
+		DuckDB source(database.path.string());
+		Connection source_conn(source);
+		REQUIRE_FALSE(source_conn.Query("CREATE TABLE items AS SELECT i FROM range(3) t(i)")->HasError());
+	}
+
+	const auto port = GetAvailablePort(SERVER_PORT + 1);
+	REQUIRE(port > 0);
+	FlightTestServer server(port);
+	DuckDB client_db(nullptr);
+	ExtensionLoader loader(*client_db.instance, "duckherder");
+	DuckherderExtension extension;
+	extension.Load(loader);
+	Connection connection(client_db);
+	const auto attach_sql = StringUtil::Format(
+	    "ATTACH ':memory:' AS dh (TYPE duckherder, server_host 'localhost', server_port %d, server_db_path %s)", port,
+	    KeywordHelper::WriteQuoted(database.path.string()));
+	// A failed attach must not occupy the single writable-client slot.
+	REQUIRE(connection
+	            .Query(StringUtil::Format(
+	                "ATTACH ':memory:' AS failed (TYPE duckherder, server_host 'localhost', "
+	                "server_port %d, server_db_path %s)",
+	                port, KeywordHelper::WriteQuoted(StringUtil::Format("%s.missing", database.path.string()))))
+	            ->HasError());
+	REQUIRE_FALSE(connection.Query(attach_sql)->HasError());
+	// Remote catalog discovery is not implemented; register the existing table's local metadata.
+	REQUIRE_FALSE(connection.Query("CREATE TABLE dh.items (i BIGINT)")->HasError());
+	REQUIRE_FALSE(connection.Query("PRAGMA duckherder_register_remote_table('items', 'items')")->HasError());
+	auto rows = connection.Query("SELECT i FROM dh.items ORDER BY i");
+	INFO((rows->HasError() ? rows->GetError() : ""));
+	REQUIRE_FALSE(rows->HasError());
+	REQUIRE(rows->GetValue(0, 0).GetValue<int64_t>() == 0);
+	REQUIRE(rows->GetValue(0, 2).GetValue<int64_t>() == 2);
+
+	StorageConfig config;
+	config.database_uri = database.path.string();
+	DistributedFlightClient reader(StringUtil::Format("grpc://localhost:%d", port), distributed::CLIENT_ROLE_READ_ONLY,
+	                               config);
+	REQUIRE(reader.Connect().ok());
+	REQUIRE(CountRows(reader, "items") == 3);
+	config.database_uri += ".different";
+	DistributedFlightClient conflicting_reader(StringUtil::Format("grpc://localhost:%d", port),
+	                                           distributed::CLIENT_ROLE_READ_ONLY, config);
+	REQUIRE_FALSE(conflicting_reader.Connect().ok());
+	REQUIRE(CountRows(reader, "items") == 3);
 }

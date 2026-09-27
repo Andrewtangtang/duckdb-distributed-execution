@@ -62,7 +62,7 @@ def main():
             assert response.success == expect_success, response.error_message
             return response
 
-        def start(role, storage_args=()):
+        def start(role, storage_args=(), client_storage_args=()):
             port = free_port()
             log = open(work / f"{role}-{port}.log", "w+")
             logs.append(log)
@@ -77,6 +77,9 @@ def main():
             request = proto.DistributedRequest()
             if role == "server":
                 request.register_client.role = proto.CLIENT_ROLE_READ_WRITE
+                for field, value in zip(("database_uri", "storage_backend", "storage_root", "storage_bucket"),
+                                        client_storage_args):
+                    setattr(request.register_client, field, value)
             else:
                 request.worker_heartbeat.worker_id = "readiness"
             try:
@@ -151,6 +154,24 @@ def main():
             subprocess.run([str(duckdb), str(native_path), "-bail"],
                            input="CREATE TABLE items AS SELECT i FROM range(3) t(i);",
                            text=True, check=True, capture_output=True)
+            # An existing alias must not hide a request for another database.
+            collision_driver, _ = start("server")
+            request = proto.DistributedRequest()
+            request.execute_sql.sql = f"ATTACH {sql_string(native_path)} AS object_db (READ_ONLY)"
+            action(collision_driver, request)
+            request = proto.DistributedRequest()
+            request.register_client.role = proto.CLIENT_ROLE_READ_ONLY
+            request.register_client.database_uri = str(native_path) + ".missing"
+            try:
+                action(collision_driver, request)
+                raise AssertionError("An existing alias hid a different requested database")
+            except (flight.FlightError, pa.ArrowInvalid) as error:
+                assert "already attached" in str(error).lower()
+
+            # A running driver can attach a database supplied by the client, without startup storage arguments.
+            dynamic_native, _ = start("server", client_storage_args=(str(native_path),))
+            assert query(dynamic_native, "SELECT i FROM items ORDER BY i")["i"].to_pylist() == [0, 1, 2]
+
             native_driver, _ = start("server", (str(native_path),))
             assert query(native_driver, "SELECT i FROM object_db.items ORDER BY i")["i"].to_pylist() == [0, 1, 2]
             native_worker, _ = start("worker", (str(native_path),))
@@ -166,6 +187,24 @@ def main():
                 raise AssertionError("Native worker attachment allowed writes")
             except (flight.FlightError, pa.ArrowInvalid) as error:
                 assert "read-only" in str(error).lower()
+
+            dynamic_driver, _ = start("server", client_storage_args=storage_args)
+            assert query(dynamic_driver, "SELECT i FROM items ORDER BY i")["i"].to_pylist() == [0, 1, 2]
+            request = proto.DistributedRequest()
+            request.register_client.role = proto.CLIENT_ROLE_READ_ONLY
+            request.register_client.database_uri = storage_args[0]
+            request.register_client.storage_backend = storage_args[1]
+            request.register_client.storage_root = storage_args[2]
+            dynamic_reader_id = action(dynamic_driver, request).register_client.client_id
+            assert query(dynamic_driver, "SELECT i FROM items ORDER BY i", dynamic_reader_id)["i"].to_pylist() == [0, 1, 2]
+            request = proto.DistributedRequest()
+            request.register_client.role = proto.CLIENT_ROLE_READ_ONLY
+            request.register_client.database_uri = "duckdb_objfs://different.db"
+            request.register_client.storage_backend = storage_args[1]
+            request.register_client.storage_root = storage_args[2]
+            response = action(dynamic_driver, request, expect_success=False)
+            assert "different storage attachment" in response.error_message
+            assert query(dynamic_driver, "SELECT i FROM items ORDER BY i")["i"].to_pylist() == [0, 1, 2]
 
             driver, _ = start("server", storage_args)
 

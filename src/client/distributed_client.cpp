@@ -13,9 +13,10 @@
 
 namespace duckdb {
 
-DistributedClient::DistributedClient(string server_url_p, distributed::ClientRole role_p)
+DistributedClient::DistributedClient(string server_url_p, distributed::ClientRole role_p,
+                                     StorageConfig storage_config_p)
     : server_url(std::move(server_url_p)) {
-	client = make_uniq<DistributedFlightClient>(server_url, role_p);
+	client = make_uniq<DistributedFlightClient>(server_url, role_p, std::move(storage_config_p));
 	auto status = client->Connect();
 	if (!status.ok()) {
 		throw Exception(ExceptionType::CONNECTION, "Failed to connect to Flight server: " + status.ToString());

@@ -7,6 +7,7 @@
 #include "duckdb/common/string.hpp"
 #include "duckdb/common/unique_ptr.hpp"
 #include "query_common.hpp"
+#include "storage_config.hpp"
 
 namespace duckdb {
 
@@ -31,7 +32,7 @@ struct QueryExecutionStatsEntry {
 
 class DistributedClient {
 public:
-	DistributedClient(string server_url_p, distributed::ClientRole role_p);
+	DistributedClient(string server_url_p, distributed::ClientRole role_p, StorageConfig storage_config_p = {});
 	~DistributedClient() = default;
 
 	void Close();

@@ -21,18 +21,18 @@
 #include "duckdb/planner/operator/logical_create_index.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
-#include "logical_remote_create_index.hpp"
 #include "duckdb/storage/database_size.hpp"
 #include "duckherder_schema_catalog_entry.hpp"
 #include "duckherder_transaction.hpp"
+#include "logical_remote_create_index.hpp"
 
 namespace duckdb {
 
 DuckherderCatalog::DuckherderCatalog(AttachedDatabase &db, string server_host_p, int server_port_p,
-                                     string server_db_path_p, distributed::ClientRole role_p)
+                                     StorageConfig storage_config_p, distributed::ClientRole role_p)
     : DuckCatalog(db), duckdb_catalog(make_uniq<DuckCatalog>(db)), db_instance(db.GetDatabase()),
-      server_host(std::move(server_host_p)), server_port(server_port_p), server_db_path(std::move(server_db_path_p)) {
-	distributed_client = make_uniq<DistributedClient>(GetServerUrl(), role_p);
+      server_host(std::move(server_host_p)), server_port(server_port_p) {
+	distributed_client = make_uniq<DistributedClient>(GetServerUrl(), role_p, std::move(storage_config_p));
 }
 
 DuckherderCatalog::~DuckherderCatalog() = default;

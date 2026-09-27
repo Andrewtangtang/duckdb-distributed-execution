@@ -1,6 +1,7 @@
 #pragma once
 
 #include "duckdb/common/string.hpp"
+#include "storage_config.hpp"
 
 namespace duckdb {
 
@@ -8,14 +9,6 @@ namespace duckdb {
 class PhysicalOperator;
 class LogicalOperator;
 class Connection;
-
-// Explicit storage settings shared by driver and worker startup hooks.
-struct StorageConfig {
-	string database_uri;
-	string backend = "local";
-	string root;
-	string bucket;
-};
 
 // Read optional storage arguments after the executable's host, port, and worker arguments.
 StorageConfig GetStorageConfig(int argc, char *argv[]);

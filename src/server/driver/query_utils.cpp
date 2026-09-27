@@ -1,10 +1,14 @@
 #include "server/driver/query_utils.hpp"
 
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/physical_operator.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/planner/logical_operator.hpp"
@@ -39,6 +43,15 @@ void InitializeStorage(Connection &conn, const StorageConfig &config) {
 		}
 		return;
 	}
+	// IF NOT EXISTS only checks the alias; verify that it still identifies the requested read-only database.
+	auto existing = DatabaseManager::Get(*conn.context).GetDatabase("object_db");
+	if (existing) {
+		auto &fs = FileSystem::GetFileSystem(*conn.context);
+		if (existing->GetCatalog().GetDBPath() != fs.CanonicalizePath(config.database_uri) || !existing->IsReadOnly()) {
+			throw InvalidInputException("object_db is already attached to a different database or access mode");
+		}
+	}
+
 	auto execute = [&](const string &sql) {
 		auto result = conn.Query(sql);
 		if (result->HasError()) {
@@ -50,8 +63,8 @@ void InitializeStorage(Connection &conn, const StorageConfig &config) {
 		    !config.bucket.empty()) {
 			throw InvalidInputException("Native database files do not accept object storage settings or URI schemes");
 		}
-		execute(
-		    StringUtil::Format("ATTACH %s AS object_db (READ_ONLY)", KeywordHelper::WriteQuoted(config.database_uri)));
+		execute(StringUtil::Format("ATTACH IF NOT EXISTS %s AS object_db (READ_ONLY)",
+		                           KeywordHelper::WriteQuoted(config.database_uri)));
 		return;
 	}
 	if (config.database_uri == "duckdb_objfs://") {
@@ -74,11 +87,13 @@ void InitializeStorage(Connection &conn, const StorageConfig &config) {
 	if (config.backend == "s3") {
 		execute("LOAD cache_httpfs");
 		// Credentials are resolved locally, never sent in worker registration requests.
-		execute(StringUtil::Format("CREATE SECRET duckherder_objfs (TYPE S3, PROVIDER credential_chain, SCOPE %s)",
-		                           KeywordHelper::WriteQuoted(StringUtil::Format("s3://%s/", config.bucket))));
+		execute(StringUtil::Format(
+		    "CREATE SECRET IF NOT EXISTS duckherder_objfs (TYPE S3, PROVIDER credential_chain, SCOPE %s)",
+		    KeywordHelper::WriteQuoted(StringUtil::Format("s3://%s/", config.bucket))));
 		execute(StringUtil::Format("SET duckdb_objfs_bucket = %s", KeywordHelper::WriteQuoted(config.bucket)));
 	}
-	execute(StringUtil::Format("ATTACH %s AS object_db (READ_ONLY)", KeywordHelper::WriteQuoted(config.database_uri)));
+	execute(StringUtil::Format("ATTACH IF NOT EXISTS %s AS object_db (READ_ONLY)",
+	                           KeywordHelper::WriteQuoted(config.database_uri)));
 }
 
 bool ContainsTableScan(const PhysicalOperator &op) {

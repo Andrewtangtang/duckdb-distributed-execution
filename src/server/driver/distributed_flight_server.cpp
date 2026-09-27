@@ -21,13 +21,16 @@
 namespace duckdb {
 
 DistributedFlightServer::ClientRegistration::ClientRegistration(DuckDB &db, WorkerManager &worker_manager,
-                                                                distributed::ClientRole role_p)
+                                                                distributed::ClientRole role_p,
+                                                                const StorageConfig &storage_config)
     : role(role_p), last_seen(GetSteadyNowMilliSecSinceEpoch()), connection(make_uniq<Connection>(db)) {
-	// Set duckling as the default database for this client session.
-	auto use_result = connection->Query("USE duckling;");
+	// Attach the requested database when initializing this client's connection.
+	InitializeStorage(*connection, storage_config);
+	// Set the attached database, or duckling when none was requested, as this session's default.
+	auto use_result = connection->Query(storage_config.database_uri.empty() ? "USE duckling" : "USE object_db");
 	if (use_result->HasError()) {
 		throw InternalException(
-		    StringUtil::Format("Failed to USE duckling for client connection: %s", use_result->GetError()));
+		    StringUtil::Format("Failed to set default database for client connection: %s", use_result->GetError()));
 	}
 	distributed_executor = make_uniq<DistributedExecutor>(worker_manager, *connection);
 }
@@ -213,8 +216,29 @@ arrow::Status DistributedFlightServer::HandleRegisterClient(const distributed::R
 		return arrow::Status::OK();
 	}
 
+	StorageConfig requested_storage;
+	requested_storage.database_uri = req.database_uri();
+	requested_storage.backend = req.storage_backend().empty() ? "local" : req.storage_backend();
+	requested_storage.root = req.storage_root();
+	requested_storage.bucket = req.storage_bucket();
+	if (requested_storage.database_uri.empty() && requested_storage.backend == "local" &&
+	    requested_storage.root.empty() && requested_storage.bucket.empty()) {
+		// Attachments without storage options retain the process's configured database.
+		requested_storage = storage_config;
+	} else if (!storage_config.database_uri.empty() &&
+	           (requested_storage.database_uri != storage_config.database_uri ||
+	            requested_storage.backend != storage_config.backend || requested_storage.root != storage_config.root ||
+	            requested_storage.bucket != storage_config.bucket)) {
+		resp.set_success(false);
+		// ponytail: one storage configuration per instance; use separate instances for independent ObjFS backends.
+		resp.set_error_message("Control node already has a different storage attachment configured");
+		return arrow::Status::OK();
+	}
+
 	auto client_id = UUID::ToString(UUID::GenerateRandomUUID());
-	clients.emplace(client_id, make_shared_ptr<ClientRegistration>(*db, *worker_manager, req.role()));
+	auto registration = make_shared_ptr<ClientRegistration>(*db, *worker_manager, req.role(), requested_storage);
+	clients.emplace(client_id, std::move(registration));
+	storage_config = std::move(requested_storage);
 	if (req.role() == distributed::CLIENT_ROLE_READ_WRITE) {
 		writable_client_id = client_id;
 	}
