@@ -1,6 +1,6 @@
-#include "distributed_create_index.hpp"
+#include "client/execution/distributed_create_index.hpp"
 
-#include "distributed_client.hpp"
+#include "client/execution/distributed_client.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/execution/execution_context.hpp"
@@ -66,7 +66,7 @@ SourceResultType PhysicalRemoteCreateIndexOperator::GetDataInternal(ExecutionCon
 	DUCKDB_LOG_DEBUG(db_instance, StringUtil::Format("Executing CREATE INDEX on remote server: %s", create_sql));
 
 	auto &client = GetDistributedClient(catalog);
-	auto result = client.ExecuteSQL(create_sql);
+	auto result = client.ExecuteStatement(create_sql);
 	if (result->HasError()) {
 		throw Exception(ExceptionType::CATALOG, "Failed to create index on server: " + result->GetError());
 	}

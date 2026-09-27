@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package duckdb.distributed;
+
+// Execute one complete non-query SQL statement on the control node.
+message ExecuteStatementRequest {
+  string sql = 1;
+  string client_catalog = 2;
+}
+
+message ExecuteStatementResponse {
+  uint64 rows_affected = 1;
+}

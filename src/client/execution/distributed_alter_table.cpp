@@ -1,6 +1,6 @@
-#include "distributed_alter_table.hpp"
+#include "client/execution/distributed_alter_table.hpp"
 
-#include "distributed_client.hpp"
+#include "client/execution/distributed_client.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
@@ -62,7 +62,7 @@ SourceResultType PhysicalRemoteAlterTableOperator::GetDataInternal(ExecutionCont
 
 	auto &catalog = Catalog::GetCatalog(context.client, catalog_name);
 	auto &client = GetDistributedClient(catalog);
-	auto result = client.ExecuteSQL(alter_sql);
+	auto result = client.ExecuteStatement(alter_sql);
 	if (result->HasError()) {
 		throw Exception(ExceptionType::CATALOG, "Failed to alter table on server: " + result->GetError());
 	}

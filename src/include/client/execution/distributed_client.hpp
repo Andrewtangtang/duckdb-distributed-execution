@@ -2,7 +2,7 @@
 
 #pragma once
 
-#include "distributed_flight_client.hpp"
+#include "client/transport/distributed_flight_client.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/string.hpp"
 #include "duckdb/common/unique_ptr.hpp"
@@ -37,36 +37,19 @@ public:
 
 	void Close();
 
-	// Execute arbitrary SQL on the server.
-	unique_ptr<QueryResult> ExecuteSQL(const string &sql);
+	// Execute one complete non-query statement on the control node.
+	unique_ptr<QueryResult> ExecuteStatement(const string &sql, const string &client_catalog = "");
+
+	unique_ptr<QueryResult> BeginTransaction();
+	unique_ptr<QueryResult> CommitTransaction();
+	unique_ptr<QueryResult> RollbackTransaction();
 
 	// Check if table exists.
 	bool TableExists(const string &table_name);
 
-	// CREATE TABLE on server.
-	// Return error status if the table already exists.
-	unique_ptr<QueryResult> CreateTable(const string &create_sql);
-
-	// DROP TABLE on server.
-	// Return success status if the table doesn't exist.
-	unique_ptr<QueryResult> DropTable(const string &drop_sql);
-
-	// CREATE INDEX on server.
-	// Return error status if the index already exists.
-	unique_ptr<QueryResult> CreateIndex(const string &create_sql);
-
-	// DROP INDEX on server.
-	// Return success status if the index doesn't exist.
-	unique_ptr<QueryResult> DropIndex(const string &index_name);
-
 	// Load an extension on the server using this attachment's registered role.
 	unique_ptr<QueryResult> LoadExtension(const string &extension_name, const string &repository = "",
 	                                      const string &version = "");
-
-	// INSERT INTO on server.
-	// TODO(hjiang): Currently for implementation easy, directly execute SQL statements, should be use transfer rows and
-	// table name.
-	unique_ptr<QueryResult> InsertInto(const string &insert_sql);
 
 	// Get table data.
 	// If [`expected_types`] is unassigned, type information is deduced from arrow schema.
@@ -79,6 +62,8 @@ public:
 	unique_ptr<QueryResult> GetQueryExecutionStats(vector<QueryExecutionStatsEntry> &stats_out);
 
 private:
+	unique_ptr<QueryResult> ManageTransaction(distributed::TransactionAction action);
+
 	string server_url;
 	unique_ptr<DistributedFlightClient> client;
 };

@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package duckdb.distributed;
+
+enum ClientRole {
+  CLIENT_ROLE_UNSPECIFIED = 0;
+  CLIENT_ROLE_READ_ONLY = 1;
+  CLIENT_ROLE_READ_WRITE = 2;
+}
+
+// Register a Duckherder attachment with the control node.
+message RegisterClientRequest {
+  ClientRole role = 1;
+  // Optional database attachment initialized on the control node for this session.
+  string database_uri = 2;
+  string storage_backend = 3;
+  string storage_root = 4;
+  string storage_bucket = 5;
+}
+
+message RegisterClientResponse {
+  string client_id = 1;
+}
+
+message UnregisterClientRequest {}
+
+message UnregisterClientResponse {}
+
+message ClientHeartbeatRequest {}
+
+message ClientHeartbeatResponse {}
+
+message LoadExtensionRequest {
+  string extension_name = 1;
+  string repository = 2;
+  string version = 3;
+}
+
+message LoadExtensionResponse {}
