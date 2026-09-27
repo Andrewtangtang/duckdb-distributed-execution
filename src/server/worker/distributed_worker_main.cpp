@@ -14,9 +14,9 @@
  *   host       - Host address to bind to (default: 0.0.0.0)
  *   port       - Port to listen on (default: 8816)
  *   worker_id  - Unique identifier for this worker (default: worker-1)
- *   database_uri - Optional duckdb_objfs:// database attached read-only as object_db
+ *   database_uri - Optional native file or duckdb_objfs:// URI attached read-only as object_db
  *   backend      - local (default) or s3
- *   root         - Local storage directory or optional S3 key prefix
+ *   root         - ObjFS local storage directory or optional S3 key prefix
  *   bucket       - Required for s3; omit for local
  *
  * Examples:
@@ -81,7 +81,7 @@ int main(int argc, char *argv[]) {
 	try {
 		// Create and start worker node.
 		// Pass nullptr for shared_db to create an independent database instance.
-		g_worker = std::make_unique<WorkerNode>(worker_id, host, port, nullptr, GetObjectStorageConfig(argc, argv));
+		g_worker = std::make_unique<WorkerNode>(worker_id, host, port, nullptr, GetStorageConfig(argc, argv));
 
 		auto status = g_worker->Start();
 		if (!status.ok()) {

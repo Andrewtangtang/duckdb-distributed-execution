@@ -18,7 +18,7 @@
 
 namespace duckdb {
 
-DistributedFlightServer::DistributedFlightServer(string host_p, int port_p, ObjectStorageConfig storage_config_p)
+DistributedFlightServer::DistributedFlightServer(string host_p, int port_p, StorageConfig storage_config_p)
     : host(std::move(host_p)), port(port_p), storage_config(std::move(storage_config_p)) {
 	Initialize();
 }
@@ -94,7 +94,7 @@ void DistributedFlightServer::Initialize() {
 	}
 
 	// Attach the shared database before creating workers or accepting requests.
-	InitializeObjectStorage(*conn, storage_config);
+	InitializeStorage(*conn, storage_config);
 
 	// Initialize worker manager and distributed executor.
 	worker_manager = make_uniq<WorkerManager>(*db);

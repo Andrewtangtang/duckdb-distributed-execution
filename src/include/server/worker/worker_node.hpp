@@ -15,7 +15,7 @@ namespace duckdb {
 class WorkerNode : public arrow::flight::FlightServerBase {
 public:
 	explicit WorkerNode(string worker_id_p, string host_p = "0.0.0.0", int port_p = 0, DuckDB *shared_db = nullptr,
-	                    const ObjectStorageConfig &storage_config = {});
+	                    const StorageConfig &storage_config = {});
 	~WorkerNode() override = default;
 
 	arrow::Status Start();

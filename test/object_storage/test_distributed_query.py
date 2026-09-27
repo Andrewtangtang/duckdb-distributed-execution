@@ -139,6 +139,27 @@ def main():
             assert query(default_driver, "SELECT 42 AS answer").to_pylist() == [{"answer": 42}]
             start("worker")
 
+            # Native files use the same startup hook without loading ObjFS.
+            native_path = work / "native's database.db"
+            subprocess.run([str(duckdb), str(native_path), "-bail"],
+                           input="CREATE TABLE items AS SELECT i FROM range(3) t(i);",
+                           text=True, check=True, capture_output=True)
+            native_driver, _ = start("server", (str(native_path),))
+            assert query(native_driver, "SELECT i FROM object_db.items ORDER BY i")["i"].to_pylist() == [0, 1, 2]
+            native_worker, _ = start("worker", (str(native_path),))
+            request = proto.DistributedRequest()
+            request.execute_partition.sql = "SELECT i FROM object_db.items ORDER BY i"
+            request.execute_partition.total_partitions = 1
+            action(native_worker, request)
+            rows = native_worker.do_get(flight.Ticket(request.SerializeToString()), options=OPTIONS).read_all()
+            assert rows["i"].to_pylist() == [0, 1, 2]
+            request.execute_partition.sql = "INSERT INTO object_db.items VALUES (3)"
+            try:
+                native_worker.do_get(flight.Ticket(request.SerializeToString()), options=OPTIONS).read_all()
+                raise AssertionError("Native worker attachment allowed writes")
+            except (flight.FlightError, pa.ArrowInvalid) as error:
+                assert "read-only" in str(error).lower()
+
             driver, _ = start("server", storage_args)
             # Query before registration keeps this check independent of partition changes.
             assert query(driver, "SELECT i FROM object_db.items ORDER BY i")["i"].to_pylist() == [0, 1, 2]

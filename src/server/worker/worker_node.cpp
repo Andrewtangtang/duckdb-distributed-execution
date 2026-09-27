@@ -23,7 +23,7 @@
 namespace duckdb {
 
 WorkerNode::WorkerNode(string worker_id_p, string host_p, int port_p, DuckDB *shared_db,
-                       const ObjectStorageConfig &storage_config)
+                       const StorageConfig &storage_config)
     : worker_id(std::move(worker_id_p)), host(std::move(host_p)), port(port_p) {
 	if (shared_db != nullptr) {
 		db = shared_db;
@@ -41,7 +41,7 @@ WorkerNode::WorkerNode(string worker_id_p, string host_p, int port_p, DuckDB *sh
 			    StringUtil::Format("Worker %s failed to USE duckling: %s", worker_id, use_result->GetError()));
 		}
 	}
-	InitializeObjectStorage(*conn, storage_config);
+	InitializeStorage(*conn, storage_config);
 }
 
 arrow::Status WorkerNode::Start() {

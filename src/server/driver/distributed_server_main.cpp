@@ -15,9 +15,9 @@
  *   host         - Host address to bind to (default: 0.0.0.0)
  *   port         - Port to listen on (default: 8815)
  *   num_workers  - Number of local workers to start (default: 0 = no distributed execution)
- *   database_uri - Optional duckdb_objfs:// database attached read-only as object_db
+ *   database_uri - Optional native file or duckdb_objfs:// URI attached read-only as object_db
  *   backend      - local (default) or s3
- *   root         - Local storage directory or optional S3 key prefix
+ *   root         - ObjFS local storage directory or optional S3 key prefix
  *   bucket       - Required for s3; omit for local
  *
  * Examples:
@@ -32,8 +32,8 @@
 
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/logging/logger.hpp"
-#include "server/driver/query_utils.hpp"
 #include "server/driver/distributed_flight_server.hpp"
+#include "server/driver/query_utils.hpp"
 
 using namespace duckdb;
 
@@ -75,7 +75,7 @@ int main(int argc, char *argv[]) {
 
 	try {
 		// Create and start Flight server.
-		g_server = std::make_unique<DistributedFlightServer>(host, port, GetObjectStorageConfig(argc, argv));
+		g_server = std::make_unique<DistributedFlightServer>(host, port, GetStorageConfig(argc, argv));
 
 		auto LogServerError = [&](const string &message) {
 			if (g_server) {

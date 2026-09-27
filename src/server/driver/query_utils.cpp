@@ -11,12 +11,12 @@
 
 namespace duckdb {
 
-ObjectStorageConfig GetObjectStorageConfig(int argc, char *argv[]) {
+StorageConfig GetStorageConfig(int argc, char *argv[]) {
 	if (argc > 8) {
 		throw InvalidInputException(
 		    "Expected [database_uri] [backend] [root] [bucket] after host, port, and worker arguments");
 	}
-	ObjectStorageConfig config;
+	StorageConfig config;
 	if (argc > 4) {
 		config.database_uri = argv[4];
 	}
@@ -32,15 +32,30 @@ ObjectStorageConfig GetObjectStorageConfig(int argc, char *argv[]) {
 	return config;
 }
 
-void InitializeObjectStorage(Connection &conn, const ObjectStorageConfig &config) {
+void InitializeStorage(Connection &conn, const StorageConfig &config) {
 	if (config.database_uri.empty()) {
 		if (!config.root.empty() || !config.bucket.empty() || config.backend != "local") {
-			throw InvalidInputException("Object storage settings require a database URI");
+			throw InvalidInputException("Storage settings require a database path or URI");
 		}
 		return;
 	}
-	if (!StringUtil::StartsWith(config.database_uri, "duckdb_objfs://") || config.database_uri == "duckdb_objfs://") {
-		throw InvalidInputException("Object storage database URI must start with duckdb_objfs:// and name a database");
+	auto execute = [&](const string &sql) {
+		auto result = conn.Query(sql);
+		if (result->HasError()) {
+			throw IOException("Storage initialization failed: %s", result->GetError());
+		}
+	};
+	if (!StringUtil::StartsWith(config.database_uri, "duckdb_objfs://")) {
+		if (config.database_uri.find("://") != string::npos || config.backend != "local" || !config.root.empty() ||
+		    !config.bucket.empty()) {
+			throw InvalidInputException("Native database files do not accept object storage settings or URI schemes");
+		}
+		execute(
+		    StringUtil::Format("ATTACH %s AS object_db (READ_ONLY)", KeywordHelper::WriteQuoted(config.database_uri)));
+		return;
+	}
+	if (config.database_uri == "duckdb_objfs://") {
+		throw InvalidInputException("Object storage database URI must name a database");
 	}
 	if (config.backend != "local" && config.backend != "s3") {
 		throw InvalidInputException("Object storage backend must be local or s3");
@@ -51,12 +66,6 @@ void InitializeObjectStorage(Connection &conn, const ObjectStorageConfig &config
 	if (config.backend == "s3" && config.bucket.empty()) {
 		throw InvalidInputException("S3 object storage requires a bucket");
 	}
-	auto execute = [&](const string &sql) {
-		auto result = conn.Query(sql);
-		if (result->HasError()) {
-			throw IOException("Object storage initialization failed: %s", result->GetError());
-		}
-	};
 	execute("LOAD duckdb_object_storage");
 	execute(StringUtil::Format("SET duckdb_objfs_backend = %s", KeywordHelper::WriteQuoted(config.backend)));
 	if (!config.root.empty()) {
