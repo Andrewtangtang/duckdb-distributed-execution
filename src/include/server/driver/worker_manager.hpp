@@ -2,12 +2,12 @@
 
 #include "duckdb.hpp"
 #include "duckdb/common/helper.hpp"
-#include "duckdb/common/mutex.hpp"
 #include "duckdb/common/string.hpp"
 #include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/common/vector.hpp"
 #include "server/driver/worker_node_client.hpp"
 #include "server/worker/worker_node.hpp"
+#include "utils/mutex.hpp"
 
 namespace duckdb {
 
@@ -48,19 +48,19 @@ public:
 	void StartLocalWorkers(idx_t num_workers);
 
 private:
-	vector<unique_ptr<WorkerInfo>> workers;
-	mutable mutex mu;
+	mutable concurrency::mutex mu;
+	vector<unique_ptr<WorkerInfo>> workers DUCKDB_GUARDED_BY(mu);
 	DuckDB &db;
 
 	// Driver node.
-	unique_ptr<WorkerInfo> driver_node;
+	unique_ptr<WorkerInfo> driver_node DUCKDB_GUARDED_BY(mu);
 
 	// Local workers used for local testing.
-	vector<unique_ptr<WorkerNode>> local_workers;
+	vector<unique_ptr<WorkerNode>> local_workers DUCKDB_GUARDED_BY(mu);
 	// Used to track next worker ID for local workers.
-	idx_t next_local_worker_id = 0;
+	idx_t next_local_worker_id DUCKDB_GUARDED_BY(mu) = 0;
 	// Used to track next available port for local workers.
-	int next_local_worker_port = 9000;
+	int next_local_worker_port DUCKDB_GUARDED_BY(mu) = 9000;
 };
 
 } // namespace duckdb

@@ -12,7 +12,6 @@ namespace duckdb {
 DistributedFlightClient::DistributedFlightClient(string server_url_p, distributed::ClientRole role_p,
                                                  optional_ptr<DatabaseInstance> db_instance_p)
     : server_url(std::move(server_url_p)), role(role_p), db_instance(db_instance_p) {
-	InitTransactionState();
 }
 
 DistributedFlightClient::~DistributedFlightClient() {
@@ -37,35 +36,40 @@ arrow::Status DistributedFlightClient::Connect() {
 
 void DistributedFlightClient::Close() {
 	stop_heartbeat = true;
-	heartbeat_cv.notify_all();
+	{
+		const concurrency::lock_guard<concurrency::mutex> lock(heartbeat_mutex);
+		heartbeat_cv.notify_all();
+	}
 	if (heartbeat_thread.joinable()) {
 		heartbeat_thread.join();
 	}
 	UnregisterClientNoThrow();
 
-	const lock_guard<mutex> lock(transaction_mutex);
+	const concurrency::lock_guard<concurrency::mutex> lock(transaction_mutex);
 	InitTransactionState();
 }
 
 void DistributedFlightClient::SetTransactionContext(optional_ptr<ClientContext> context) {
+	const concurrency::lock_guard<concurrency::mutex> lock(transaction_mutex);
 	transaction_state.context = context;
 }
 
 bool DistributedFlightClient::HasActiveTransaction() {
-	const lock_guard<mutex> lock(transaction_mutex);
+	const concurrency::lock_guard<concurrency::mutex> lock(transaction_mutex);
 	return transaction_state.transaction_id != INVALID_TRANSACTION_ID;
 }
 
 arrow::Status DistributedFlightClient::EnsureExplicitTransaction() {
 	{
-		const lock_guard<mutex> lock(transaction_mutex);
+		const concurrency::lock_guard<concurrency::mutex> lock(transaction_mutex);
 		if (transaction_state.pending_action != distributed::TRANSACTION_ACTION_UNSPECIFIED) {
 			distributed::DistributedResponse response;
 			ARROW_RETURN_NOT_OK(ResolvePendingTransaction(response));
 		}
-	}
-	if (!transaction_state.context || transaction_state.context->transaction.IsAutoCommit() || HasActiveTransaction()) {
-		return arrow::Status::OK();
+		if (!transaction_state.context || transaction_state.context->transaction.IsAutoCommit() ||
+		    transaction_state.transaction_id != INVALID_TRANSACTION_ID) {
+			return arrow::Status::OK();
+		}
 	}
 	distributed::DistributedResponse response;
 	ARROW_RETURN_NOT_OK(ManageTransaction(distributed::TRANSACTION_ACTION_BEGIN, response));
@@ -159,7 +163,7 @@ void DistributedFlightClient::UnregisterClientNoThrow() {
 }
 
 void DistributedFlightClient::HeartbeatLoop() {
-	unique_lock<mutex> lock(heartbeat_mutex);
+	concurrency::unique_lock<concurrency::mutex> lock(heartbeat_mutex);
 	while (!stop_heartbeat) {
 		if (heartbeat_cv.wait_for(lock, std::chrono::seconds(10), [this] { return stop_heartbeat.load(); })) {
 			break;
@@ -184,7 +188,7 @@ arrow::Status DistributedFlightClient::ExecuteStatement(const string &sql, const
 
 arrow::Status DistributedFlightClient::ManageTransaction(distributed::TransactionAction action,
                                                          distributed::DistributedResponse &response) {
-	lock_guard<mutex> lock(transaction_mutex);
+	concurrency::lock_guard<concurrency::mutex> lock(transaction_mutex);
 	if (action == distributed::TRANSACTION_ACTION_BEGIN && transaction_state.transaction_id != INVALID_TRANSACTION_ID &&
 	    transaction_state.pending_action != distributed::TRANSACTION_ACTION_UNSPECIFIED) {
 		ARROW_RETURN_NOT_OK(ResolvePendingTransaction(response));
@@ -275,7 +279,7 @@ arrow::Status DistributedFlightClient::TableExists(const string &table_name, boo
 arrow::Status DistributedFlightClient::InsertData(const string &table_name, std::shared_ptr<arrow::RecordBatch> batch,
                                                   distributed::DistributedResponse &response) {
 	ARROW_RETURN_NOT_OK(EnsureExplicitTransaction());
-	const lock_guard<mutex> lock(transaction_mutex);
+	const concurrency::lock_guard<concurrency::mutex> lock(transaction_mutex);
 	distributed::DistributedRequest identity_request;
 	auto identity = AssignRequestIdentity(identity_request);
 	auto retry_config = db_instance ? GetRetryConfig(*db_instance) : RetryConfig();
@@ -308,7 +312,7 @@ arrow::Status DistributedFlightClient::InsertData(const string &table_name, std:
 arrow::Status DistributedFlightClient::ScanTable(const string &table_name, uint64_t limit, uint64_t offset,
                                                  vector<std::shared_ptr<arrow::RecordBatch>> &batches) {
 	ARROW_RETURN_NOT_OK(EnsureExplicitTransaction());
-	const lock_guard<mutex> lock(transaction_mutex);
+	const concurrency::lock_guard<concurrency::mutex> lock(transaction_mutex);
 	distributed::DistributedRequest req;
 	auto *scan_req = req.mutable_scan_table();
 	scan_req->set_table_name(table_name);
@@ -380,7 +384,7 @@ void DistributedFlightClient::FinishRequest(const RequestIdentity &identity, con
 arrow::Status DistributedFlightClient::SendIdempotentAction(distributed::DistributedRequest &req,
                                                             distributed::DistributedResponse &resp) {
 	ARROW_RETURN_NOT_OK(EnsureExplicitTransaction());
-	const lock_guard<mutex> lock(transaction_mutex);
+	const concurrency::lock_guard<concurrency::mutex> lock(transaction_mutex);
 	auto identity = AssignRequestIdentity(req);
 	auto status = SendActionWithRetry(req, resp);
 	FinishRequest(identity, status);

@@ -4,13 +4,13 @@
 #include "distributed.pb.h"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/duck_catalog.hpp"
-#include "duckdb/common/mutex.hpp"
 #include "duckdb/common/string.hpp"
 #include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/planner/logical_operator.hpp"
+#include "utils/mutex.hpp"
 
 namespace duckdb {
 
@@ -104,8 +104,8 @@ public:
 	bool IsRemoteIndex(const string &index_name) const;
 
 private:
-	mutex mu;
-	unordered_map<string, unique_ptr<SchemaCatalogEntry>> schema_catalog_entries;
+	concurrency::mutex mu;
+	unordered_map<string, unique_ptr<SchemaCatalogEntry>> schema_catalog_entries DUCKDB_GUARDED_BY(mu);
 
 	unique_ptr<DuckCatalog> duckdb_catalog;
 	DatabaseInstance &db_instance;
@@ -117,20 +117,20 @@ private:
 
 	// Remote table configuration.
 	// TODO(hjiang): Currently remote tables lives in memory, should provide options to persist and load.
-	mutable mutex remote_tables_mu;
-	unordered_map<string, RemoteTableConfig> remote_tables;
+	mutable concurrency::mutex remote_tables_mu;
+	unordered_map<string, RemoteTableConfig> remote_tables DUCKDB_GUARDED_BY(remote_tables_mu);
 
 	// Remote index tracking.
 	// TODO(hjiang): Currently remote indexes live in memory, should provide options to persist and load.
-	mutable mutex remote_indexes_mu;
-	unordered_set<string> remote_indexes;
+	mutable concurrency::mutex remote_indexes_mu;
+	unordered_set<string> remote_indexes DUCKDB_GUARDED_BY(remote_indexes_mu);
 
 	// Client instance for this catalog.
 	//
 	// TODO(hjiang): Own one remote client registration per DuckDB ClientContext so every user connection maps to an
 	// independent Control Node connection instead of sharing this catalog-level client.
-	mutable mutex client_mu;
-	unique_ptr<DistributedClient> distributed_client;
+	mutable concurrency::mutex client_mu;
+	unique_ptr<DistributedClient> distributed_client DUCKDB_GUARDED_BY(client_mu);
 };
 
 } // namespace duckdb

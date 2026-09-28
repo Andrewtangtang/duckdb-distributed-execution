@@ -5,12 +5,12 @@
 #include "client/transport/transaction_state.hpp"
 #include "distributed.pb.h"
 #include "duckdb/common/atomic.hpp"
-#include "duckdb/common/mutex.hpp"
 #include "duckdb/common/optional_ptr.hpp"
 #include "duckdb/common/string.hpp"
 #include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/main/query_result.hpp"
+#include "utils/mutex.hpp"
 
 #include <arrow/flight/api.h>
 #include <arrow/record_batch.h>
@@ -72,15 +72,17 @@ private:
 	void UnregisterClientNoThrow();
 	void HeartbeatLoop();
 
-	RequestIdentity AssignRequestIdentity(distributed::DistributedRequest &req);
-	void FinishRequest(const RequestIdentity &identity, const arrow::Status &status);
+	RequestIdentity AssignRequestIdentity(distributed::DistributedRequest &req) DUCKDB_REQUIRES(transaction_mutex);
+	void FinishRequest(const RequestIdentity &identity, const arrow::Status &status) DUCKDB_REQUIRES(transaction_mutex);
 	arrow::Status EnsureExplicitTransaction();
 	distributed::DistributedRequest CreateTransactionRequest(distributed::TransactionAction action,
-	                                                         uint64_t request_sequence) const;
+	                                                         uint64_t request_sequence) const
+	    DUCKDB_REQUIRES(transaction_mutex);
 	arrow::Status SendActionWithRetry(const distributed::DistributedRequest &req,
 	                                  distributed::DistributedResponse &resp);
-	arrow::Status ResolvePendingTransaction(distributed::DistributedResponse &response);
-	void InitTransactionState();
+	arrow::Status ResolvePendingTransaction(distributed::DistributedResponse &response)
+	    DUCKDB_REQUIRES(transaction_mutex);
+	void InitTransactionState() DUCKDB_REQUIRES(transaction_mutex);
 	// RPC implementation to send request and block wait response.
 	arrow::Status SendAction(const distributed::DistributedRequest &req, distributed::DistributedResponse &resp);
 	// Assign the active transaction and one operation sequence, then replay that operation on transport failures.
@@ -94,12 +96,12 @@ private:
 	arrow::flight::Location location;
 	std::unique_ptr<arrow::flight::FlightClient> client;
 	atomic<bool> stop_heartbeat {false};
-	mutex heartbeat_mutex;
-	std::condition_variable heartbeat_cv;
+	concurrency::mutex heartbeat_mutex;
+	std::condition_variable heartbeat_cv DUCKDB_GUARDED_BY(heartbeat_mutex);
 	std::thread heartbeat_thread;
 	// Serializes all transaction RPCs and retains stable identifiers needed to retry an ambiguous operation.
-	mutex transaction_mutex;
-	DistributedTransactionState transaction_state;
+	concurrency::mutex transaction_mutex;
+	DistributedTransactionState transaction_state DUCKDB_GUARDED_BY(transaction_mutex);
 };
 
 } // namespace duckdb

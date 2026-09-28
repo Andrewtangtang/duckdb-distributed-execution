@@ -4,13 +4,13 @@
 #include "duckdb/catalog/catalog_entry/duck_schema_entry.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
-#include "duckdb/common/mutex.hpp"
 #include "duckdb/common/string.hpp"
 #include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 #include "entry_lookup_info_hash_utils.hpp"
+#include "utils/mutex.hpp"
 
 // TODO(hjiang): Likely will switch to forward declaration.
 #include "duckherder_table_catalog_entry.hpp"
@@ -76,8 +76,10 @@ public:
 	void Alter(CatalogTransaction transaction, AlterInfo &info) override;
 
 private:
-	CatalogEntry *WrapAndCacheTableCatalogEntryWithLock(EntryLookupInfoKey key, CatalogEntry *catalog_entry);
-	CatalogEntry *WrapAndCacheIndexCatalogEntryWithLock(EntryLookupInfoKey key, CatalogEntry *catalog_entry);
+	CatalogEntry *WrapAndCacheTableCatalogEntryWithLock(EntryLookupInfoKey key, CatalogEntry *catalog_entry)
+	    DUCKDB_REQUIRES(mu);
+	CatalogEntry *WrapAndCacheIndexCatalogEntryWithLock(EntryLookupInfoKey key, CatalogEntry *catalog_entry)
+	    DUCKDB_REQUIRES(mu);
 
 	void DropRemoteIndex(ClientContext &context, DropInfo &info, DuckherderCatalog &md_catalog);
 	void DropRemoteTable(ClientContext &context, DropInfo &info, DuckherderCatalog &md_catalog);
@@ -88,10 +90,10 @@ private:
 	// Direct reference to DuckherderCatalog.
 	Catalog &duckherder_catalog_ref;
 
-	mutex mu;
+	concurrency::mutex mu;
 	// Cache for catalog entries, including table entries.
 	unordered_map<EntryLookupInfoKey, unique_ptr<CatalogEntry>, EntryLookupInfoHash, EntryLookupInfoEqual>
-	    catalog_entries;
+	    catalog_entries DUCKDB_GUARDED_BY(mu);
 };
 
 } // namespace duckdb
