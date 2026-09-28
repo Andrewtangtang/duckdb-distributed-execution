@@ -31,15 +31,16 @@ struct QueryExecutionStatsEntry {
 
 class DistributedClient {
 public:
-	DistributedClient(string server_url_p, distributed::ClientRole role_p);
+	DistributedClient(string server_url_p, distributed::ClientRole role_p, DatabaseInstance &db_instance);
 	~DistributedClient() = default;
 
 	void Close();
+	void SetTransactionContext(optional_ptr<ClientContext> context);
+	bool HasActiveRemoteTransaction();
 
 	// Execute one complete non-query statement on the control node.
 	unique_ptr<QueryResult> ExecuteStatement(const string &sql, const string &client_catalog = "");
 
-	unique_ptr<QueryResult> BeginTransaction();
 	unique_ptr<QueryResult> CommitTransaction();
 	unique_ptr<QueryResult> RollbackTransaction();
 

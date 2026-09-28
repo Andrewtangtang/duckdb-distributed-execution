@@ -2,12 +2,13 @@
 
 #include "distributed.pb.h"
 #include "duckdb.hpp"
-#include "duckdb/common/atomic.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/string.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/unique_ptr.hpp"
+#include "server/driver/client_registration.hpp"
 #include "server/driver/distributed_executor.hpp"
+#include "server/driver/distributed_flight_server_test_state.hpp"
 #include "server/driver/query_plan_analyzer.hpp"
 #include "server/driver/worker_manager.hpp"
 
@@ -97,23 +98,11 @@ public:
 	                    std::unique_ptr<arrow::flight::FlightMetadataWriter> writer) override;
 
 	DatabaseInstance &GetDatabaseInstance();
-	void SetClientLeaseTimeoutForTesting(std::chrono::milliseconds timeout);
+
+	// Test hooks.
+	DistributedFlightServerTestState &GetTestStateForTesting();
 
 private:
-	struct ClientRegistration {
-		ClientRegistration(DuckDB &db, WorkerManager &worker_manager, distributed::ClientRole role_p);
-
-		distributed::ClientRole role;
-		// Last authorized request time in steady-clock milliseconds, updated concurrently by RPC handlers.
-		atomic<int64_t> last_seen;
-		// DuckDB connections are session-scoped and must not execute concurrent requests.
-		mutex connection_mutex;
-		// Dedicated DuckDB session for this registered client.
-		unique_ptr<Connection> connection;
-		// Distributed execution components bound to this client's DuckDB session.
-		unique_ptr<DistributedExecutor> distributed_executor;
-	};
-
 	// Implementation methods for Flight RPC handlers, without exception handling.
 	arrow::Status DoActionImpl(const arrow::flight::ServerCallContext &context, const arrow::flight::Action &action,
 	                           std::unique_ptr<arrow::flight::ResultStream> *result);
@@ -129,8 +118,10 @@ private:
 	arrow::Status HandleRegisterClient(const distributed::RegisterClientRequest &req,
 	                                   distributed::DistributedResponse &resp);
 	arrow::Status HandleUnregisterClient(const string &client_id, distributed::DistributedResponse &resp);
-	arrow::Status HandleTransaction(const distributed::TransactionRequest &req, ClientRegistration &registration,
+	arrow::Status HandleTransaction(const distributed::DistributedRequest &req, ClientRegistration &registration,
 	                                distributed::DistributedResponse &resp);
+	void ExecuteTransactionAction(const distributed::DistributedRequest &req, ClientRegistration &registration,
+	                              distributed::DistributedResponse &resp);
 	arrow::Status HandleExecuteStatement(const distributed::ExecuteStatementRequest &req,
 	                                     ClientRegistration &registration, distributed::DistributedResponse &resp);
 
@@ -147,13 +138,14 @@ private:
 	arrow::Status HandleTableExists(const distributed::TableExistsRequest &req, ClientRegistration &registration,
 	                                distributed::DistributedResponse &resp);
 	arrow::Status HandleScanTable(const distributed::ScanTableRequest &req, ClientRegistration &registration,
-	                              std::unique_ptr<arrow::flight::FlightDataStream> &stream);
+	                              std::shared_ptr<arrow::Schema> &schema,
+	                              vector<std::shared_ptr<arrow::RecordBatch>> &batches);
 	arrow::Status HandleInsertData(const std::string &table_name, std::shared_ptr<arrow::RecordBatch> batch,
 	                               ClientRegistration &registration, distributed::DistributedResponse &resp);
 
 	// Convert DuckDB result to Arrow RecordBatch.
-	arrow::Status QueryResultToArrow(QueryResult &result, std::shared_ptr<arrow::RecordBatchReader> &reader,
-	                                 idx_t *row_count = nullptr);
+	arrow::Status QueryResultToArrow(QueryResult &result, std::shared_ptr<arrow::Schema> &schema,
+	                                 vector<std::shared_ptr<arrow::RecordBatch>> &batches, idx_t *row_count = nullptr);
 
 	// Initialize DuckDB instance, connection, and components.
 	void Initialize();
@@ -167,6 +159,15 @@ private:
 	// Validate registration against the minimum role while holding clients_mutex, renewing the lease on success.
 	bool AuthorizeClient(const string &client_id, distributed::ClientRole required_role,
 	                     shared_ptr<ClientRegistration> &registration, distributed::DistributedResponse &resp);
+	// Validate a transaction-scoped request and indicate whether its latest result can be replayed.
+	arrow::Status CheckRequestReplay(const distributed::DistributedRequest &request,
+	                                 const ClientRegistration &registration, ClientRequestTransport transport,
+	                                 const string &signature, bool &replay);
+	// Replace the bounded per-client replay entry after an operation has completed.
+	void CacheActionResponse(const distributed::DistributedRequest &request, ClientRegistration &registration,
+	                         ClientRequestTransport transport, const string &signature,
+	                         const distributed::DistributedResponse &response);
+	void ClearRequestReplay(ClientRegistration &registration);
 	string host;
 	int port;
 	unique_ptr<DuckDB> db;
@@ -176,7 +177,7 @@ private:
 	mutable std::shared_mutex clients_mutex;
 	unordered_map<string, shared_ptr<ClientRegistration>> clients;
 	string writable_client_id;
-	std::chrono::milliseconds client_lease_timeout = std::chrono::seconds(30);
+	DistributedFlightServerTestState test_state;
 
 	// Query execution tracking.
 	mutable mutex query_history_mutex;
