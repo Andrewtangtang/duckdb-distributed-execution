@@ -1,8 +1,19 @@
-## 0.0.10
+## 0.10.0
 
 ### Added
 
-- Add descriptions, examples, categories, and argument names for all Duckherder SQL and pragma functions in `duckdb_functions()`.
+- Add descriptions, examples, categories, and argument names for all Duckherder SQL and pragma functions in
+  `duckdb_functions()`.
+
+### Changed
+
+- Use the Duckherder `ATTACH` path as the remote `host:port` endpoint instead of `server_host` and `server_port`
+  options.
+
+### Removed
+
+- Remove the public `duckherder_register_remote_table` pragma; remote tables are registered automatically during
+  discovery and creation.
 
 ### Fixed
 
