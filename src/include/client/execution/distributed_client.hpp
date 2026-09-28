@@ -7,6 +7,7 @@
 #include "duckdb/common/string.hpp"
 #include "duckdb/common/unique_ptr.hpp"
 #include "query_common.hpp"
+#include "utils/mutex.hpp"
 
 namespace duckdb {
 
@@ -35,7 +36,8 @@ public:
 	~DistributedClient() = default;
 
 	void Close();
-	void SetTransactionContext(optional_ptr<ClientContext> context);
+	void SetTransactionContext(ClientContext &context);
+	void ClearTransactionContext();
 	bool HasActiveRemoteTransaction();
 
 	// Execute one complete non-query statement on the control node.
@@ -62,10 +64,23 @@ public:
 	unique_ptr<QueryResult> GetQueryExecutionStats(vector<QueryExecutionStatsEntry> &stats_out);
 
 private:
-	unique_ptr<QueryResult> ManageTransaction(distributed::TransactionAction action);
-
 	string server_url;
-	unique_ptr<DistributedFlightClient> client;
+	mutable concurrency::mutex lifecycle_mutex;
+	unique_ptr<DistributedFlightClient> client DUCKDB_GUARDED_BY(lifecycle_mutex);
+	bool closed DUCKDB_GUARDED_BY(lifecycle_mutex) = false;
+
+	class DUCKDB_SCOPED_CAPABILITY DistributedClientLock {
+	public:
+		explicit DistributedClientLock(DistributedClient &owner_p) DUCKDB_ACQUIRE(owner_p.lifecycle_mutex);
+		~DistributedClientLock() DUCKDB_RELEASE();
+
+	private:
+		concurrency::lock_guard<concurrency::mutex> guard;
+	};
+
+	DistributedFlightClient &GetClient(DistributedClientLock &) DUCKDB_REQUIRES(lifecycle_mutex);
+
+	unique_ptr<QueryResult> ManageTransaction(distributed::TransactionAction action);
 };
 
 } // namespace duckdb

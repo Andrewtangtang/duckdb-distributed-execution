@@ -7,7 +7,7 @@
 #include "duckdb/common/vector.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database_manager.hpp"
-#include "utils/catalog_utils.hpp"
+#include "duckherder_catalog.hpp"
 
 namespace duckdb {
 
@@ -69,10 +69,12 @@ unique_ptr<GlobalTableFunctionState> QueryExecutionStatsTableFuncInit(ClientCont
 	auto databases = db_manager.GetDatabases();
 	for (auto &db : databases) {
 		auto &catalog = db->GetCatalog();
-		if (catalog.GetCatalogType() == "duckherder") {
-			client_to_use = &GetDistributedClient(catalog);
-			break;
+		if (catalog.GetCatalogType() != "duckherder") {
+			continue;
 		}
+		auto &duckherder_catalog = catalog.Cast<DuckherderCatalog>();
+		client_to_use = &duckherder_catalog.GetClient(context);
+		break;
 	}
 
 	if (client_to_use == nullptr) {
@@ -80,6 +82,9 @@ unique_ptr<GlobalTableFunctionState> QueryExecutionStatsTableFuncInit(ClientCont
 	}
 
 	auto query_result = client_to_use->GetQueryExecutionStats(result->query_stats);
+	if (query_result->HasError()) {
+		query_result->ThrowError("Failed to get Duckherder query execution stats: ");
+	}
 	return std::move(result);
 }
 
