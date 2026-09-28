@@ -18,6 +18,7 @@ Feel free to play around with it, give me feedback, and ping me for feature requ
 - [Installation](#installation)
 - [Object Storage](#object-storage)
 - [Usage](#usage)
+- [Current Limitations and Unsupported Features](#current-limitations-and-unsupported-features)
 - [Roadmap](#roadmap)
 
 ## Overview
@@ -543,19 +544,74 @@ SELECT duckherder_clear_query_recorder_stats();
 SELECT COUNT(*) FROM duckherder_get_query_history();  -- Returns: 0
 ```
 
+## Current Limitations and Unsupported Features
+
+Duckherder is still experimental. Some features are completely unsupported, while some SQL features are supported only
+through local execution on the Driver/Control Node.
+
+### Not Implemented
+
+- `CREATE VIEW` and remote view discovery. Consequently, remote views cannot be queried or managed through a
+  Duckherder attachment.
+- `CREATE SEQUENCE` and remote sequence discovery.
+- `ALTER SCHEMA`.
+- `ALTER TABLE` variants other than add/drop/rename column, rename table, change column type, set a default, and
+  set/drop `NOT NULL`. For example, adding or dropping constraints is not implemented by the remote ALTER path.
+- Returning result rows from `INSERT ... RETURNING`, `UPDATE ... RETURNING`, or `DELETE ... RETURNING`. The mutation
+  can run, but the current protocol returns only status and affected-row metadata.
+- Full Arrow transport for `STRUCT`, `MAP`, `UNION`, nested `LIST`, `BIT`, `BIGNUM`, and non-string dictionary types.
+  Unsupported values may be converted to `VARCHAR` or rejected.
+- A persistent default Duckling database and server restart recovery. The default server database is in memory.
+- Authentication, authorization, connection pooling, multiple server-side DuckDB instances, automatic worker
+  replacement, dynamic worker scaling, query result caching, and query resource-consumption tracking.
+
+### Supported, but Not Distributed
+
+Worker execution currently accepts only a single table scan with projections, filters, and limited aggregation or
+`GROUP BY`. The following features fall back to execution on the Driver/Control Node instead of running across workers:
+
+- joins and multi-table plans;
+- `DISTINCT`;
+- `ORDER BY`;
+- `LIMIT` and `OFFSET`;
+- window functions;
+- common table expressions, including recursive CTEs;
+- set operations such as `UNION`, `INTERSECT`, and `EXCEPT`; and
+- all DDL and DML writes.
+
+### Experimental or Incomplete
+
+- Distributed aggregate and `GROUP BY` finalization uses output-column-name heuristics. Distributed `AVG` can be
+  incorrect when partitions contain different row counts, and aliases can prevent recognition of `COUNT`, `SUM`,
+  `MIN`, `MAX`, or `AVG`.
+- Initial catalog discovery loads schemas, enum types, and tables only. Existing indexes, macros, views, sequences, and
+  other catalog entries are not restored into the client metadata cache after a new `ATTACH`.
+- Basic `BEGIN`, `COMMIT`, and `ROLLBACK` forwarding is supported, but transaction outcomes are not durable across
+  server restarts. Object-storage snapshot coordination and propagation are still work in progress.
+- A failed worker task is not retried or reassigned automatically. Replacing a driver also does not synchronize the
+  workers registered with the previous driver.
+- Query execution statistics are held in memory and are not persisted.
+
+See the [Roadmap](#roadmap) for planned work.
+
 ## Roadmap
 
 ### Table and Index Operations
 - [x] Create/drop table
 - [x] Create/drop index
 - [x] Update table schema
+- [ ] Create/drop view
+- [ ] Create/drop sequence
+- [ ] Alter schema
 - [ ] Update index
 
 ### Data Type Support
 - [x] Primitive type support
-- [ ] List type support
+- [x] List type support for primitive elements
+- [ ] Nested list type support
 - [ ] Map type support
 - [ ] Struct type support
+- [ ] Union type support
 
 ### Distributed Query Support
 - [x] Intelligent query partitioning
@@ -563,9 +619,10 @@ SELECT COUNT(*) FROM duckherder_get_query_history();  -- Returns: 0
 - [x] Row group-aligned execution
 - [x] Range-based partitioning
 - [ ] Aggregation pushdown (infrastructure ready)
-- [ ] GROUP BY distributed execution
+- [ ] Correct GROUP BY distributed finalization
 - [ ] JOIN optimization (broadcast/co-partition)
 - [ ] ORDER BY support (distributed sort)
+- [ ] DISTINCT, LIMIT/OFFSET, window, CTE, and set-operation support
 - [x] Driver collect partition and execution stats
 
 ### Multi-Client Support
@@ -576,7 +633,8 @@ SELECT COUNT(*) FROM duckherder_get_query_history();  -- Returns: 0
 ### Full Write Support
 - [ ] Persist server-side database file
 - [ ] Recover DuckDB instance via database file
-- [ ] Transaction support
+- [x] Basic transaction forwarding
+- [ ] Durable transaction and snapshot recovery
 
 ### Additional Features
 - [x] Query timing statistics
