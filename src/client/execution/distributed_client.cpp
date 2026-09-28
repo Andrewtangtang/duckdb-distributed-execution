@@ -19,12 +19,30 @@ unique_ptr<QueryResult> MakeErrorResult(const string &error) {
 	return make_uniq<MaterializedQueryResult>(ErrorData(error));
 }
 
-unique_ptr<QueryResult> MakeEmptyResult(StatementType statement_type) {
-	vector<string> names;
-	vector<LogicalType> types;
+unique_ptr<QueryResult> MakeEmptyResult(StatementType statement_type, string name, LogicalType type) {
+	vector<string> names {std::move(name)};
+	vector<LogicalType> types {std::move(type)};
 	auto collection = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator(), types);
 	return make_uniq<MaterializedQueryResult>(statement_type, StatementProperties(), names, std::move(collection),
 	                                          ClientProperties());
+}
+
+// Match DuckDB's binder-defined result schemas, when these remote operations return no result rows.
+unique_ptr<QueryResult> MakeStatementResult(StatementType statement_type) {
+	switch (statement_type) {
+	case StatementType::CREATE_STATEMENT:
+	case StatementType::INSERT_STATEMENT:
+	case StatementType::DELETE_STATEMENT:
+	case StatementType::UPDATE_STATEMENT:
+		return MakeEmptyResult(statement_type, "Count", LogicalType::BIGINT);
+	case StatementType::ALTER_STATEMENT:
+	case StatementType::DROP_STATEMENT:
+	case StatementType::TRANSACTION_STATEMENT:
+	case StatementType::LOAD_STATEMENT:
+		return MakeEmptyResult(statement_type, "Success", LogicalType::BOOLEAN);
+	default:
+		throw InternalException("Unsupported remote statement result type");
+	}
 }
 
 string GetResponseError(const arrow::Status &status, const distributed::DistributedResponse &response) {
@@ -89,7 +107,8 @@ DistributedClient::DistributedClient(string server_url_p, distributed::ClientRol
 	client = make_uniq<DistributedFlightClient>(server_url, role_p, db_instance);
 	auto status = client->Connect();
 	if (!status.ok()) {
-		throw Exception(ExceptionType::CONNECTION, "Failed to connect to Flight server: " + status.ToString());
+		throw Exception(ExceptionType::CONNECTION,
+		                StringUtil::Format("Failed to connect to Flight server: %s", status.ToString()));
 	}
 }
 
@@ -174,6 +193,14 @@ unique_ptr<QueryResult> DistributedClient::ScanTable(const string &table_name, i
 	}
 
 	if (collection == nullptr) {
+		// DuckDB initializes an empty result from the bound schema before execution. Flight can return no batches for
+		// an empty relation, so retain the caller's bound types instead of constructing an invalid zero-column result.
+		if (expected_types != nullptr) {
+			types = *expected_types;
+			// The table scan's output names come from its binding; placeholders keep this internal result schema
+			// aligned.
+			names.resize(types.size());
+		}
 		collection = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator(), types);
 	}
 	return make_uniq<MaterializedQueryResult>(StatementType::SELECT_STATEMENT, StatementProperties(), names,
@@ -190,7 +217,8 @@ bool DistributedClient::TableExists(const string &table_name) {
 	return exists;
 }
 
-unique_ptr<QueryResult> DistributedClient::ExecuteStatement(const string &sql, const string &client_catalog) {
+unique_ptr<QueryResult> DistributedClient::ExecuteStatement(const string &sql, StatementType statement_type,
+                                                            const string &client_catalog) {
 	DistributedClientLock lock(*this);
 	distributed::DistributedResponse response;
 	auto status = GetClient(lock).ExecuteStatement(sql, client_catalog, response);
@@ -198,7 +226,7 @@ unique_ptr<QueryResult> DistributedClient::ExecuteStatement(const string &sql, c
 	if (!error.empty()) {
 		return MakeErrorResult(error);
 	}
-	return MakeEmptyResult(StatementType::INSERT_STATEMENT);
+	return MakeStatementResult(statement_type);
 }
 
 unique_ptr<QueryResult> DistributedClient::CommitTransaction() {
@@ -217,7 +245,7 @@ unique_ptr<QueryResult> DistributedClient::ManageTransaction(distributed::Transa
 	if (!error.empty()) {
 		return MakeErrorResult(error);
 	}
-	return MakeEmptyResult(StatementType::TRANSACTION_STATEMENT);
+	return MakeStatementResult(StatementType::TRANSACTION_STATEMENT);
 }
 
 unique_ptr<QueryResult> DistributedClient::LoadExtension(const string &extension_name, const string &repository,
@@ -229,7 +257,7 @@ unique_ptr<QueryResult> DistributedClient::LoadExtension(const string &extension
 	if (!error.empty()) {
 		return MakeErrorResult(error);
 	}
-	return MakeEmptyResult(StatementType::LOAD_STATEMENT);
+	return MakeStatementResult(StatementType::LOAD_STATEMENT);
 }
 
 unique_ptr<QueryResult> DistributedClient::GetQueryExecutionStats(vector<QueryExecutionStatsEntry> &stats_out) {
@@ -250,7 +278,7 @@ unique_ptr<QueryResult> DistributedClient::GetQueryExecutionStats(vector<QueryEx
 		stats_out.emplace_back(stats_response.query_executions(idx));
 	}
 
-	return MakeEmptyResult(StatementType::SELECT_STATEMENT);
+	return MakeEmptyResult(StatementType::SELECT_STATEMENT, "Success", LogicalType::BOOLEAN);
 }
 
 } // namespace duckdb

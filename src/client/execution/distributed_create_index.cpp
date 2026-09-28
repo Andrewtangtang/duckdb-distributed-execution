@@ -3,6 +3,7 @@
 #include "client/execution/distributed_client.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -67,17 +68,16 @@ SourceResultType PhysicalRemoteCreateIndexOperator::GetDataInternal(ExecutionCon
 	DUCKDB_LOG_DEBUG(db_instance, StringUtil::Format("Executing CREATE INDEX on remote server: %s", create_sql));
 
 	auto &client = GetDistributedClient(context.client, catalog);
-	auto result = client.ExecuteStatement(create_sql);
+	auto result = client.ExecuteStatement(create_sql, StatementType::CREATE_STATEMENT);
 	if (result->HasError()) {
-		throw Exception(ExceptionType::CATALOG, "Failed to create index on server: " + result->GetError());
+		throw CatalogException("Failed to create index on server: %s", result->GetError());
 	}
 
 	// Create local catalog entry for tracking, and register the index as remote.
 	auto transaction = catalog.GetCatalogTransaction(context.client);
 	auto index_entry = schema.CreateIndex(transaction, *info, table);
 	if (index_entry == nullptr) {
-		throw Exception(ExceptionType::CATALOG,
-		                StringUtil::Format("Failed to create catalog entry for index %s", info->index_name));
+		throw CatalogException("Failed to create catalog entry for index %s", info->index_name);
 	}
 
 	gstate.executed = true;
