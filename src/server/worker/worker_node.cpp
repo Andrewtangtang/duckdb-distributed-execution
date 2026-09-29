@@ -1,3 +1,5 @@
+#include "server/worker/worker_node.hpp"
+
 #include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
@@ -12,7 +14,6 @@
 #include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/parser/statement/logical_plan_statement.hpp"
-#include "server/worker/worker_node.hpp"
 #include "server/driver/query_utils.hpp"
 
 #include <arrow/array.h>

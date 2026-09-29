@@ -53,7 +53,7 @@ private:
 	unique_ptr<DuckDB> owned_db;
 	unique_ptr<Connection> conn;
 	concurrency::mutex connection_mutex;
-	string attached_storage_config;
+	string attached_storage_config DUCKDB_GUARDED_BY(connection_mutex);
 };
 
 } // namespace duckdb

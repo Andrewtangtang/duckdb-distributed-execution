@@ -1,5 +1,7 @@
 #include "server/driver/worker_node_client.hpp"
 
+#include "duckdb/common/string_util.hpp"
+
 namespace duckdb {
 
 WorkerNodeClient::WorkerNodeClient(const string &location_p) : location(std::move(location_p)) {
@@ -24,7 +26,8 @@ arrow::Status WorkerNodeClient::InitializeStorage(const distributed::StorageConf
 	distributed::DistributedResponse response;
 	if (!response.ParseFromArray(result->body->data(), result->body->size()) || !response.success() ||
 	    !response.has_initialize_worker()) {
-		return arrow::Status::Invalid("Worker storage initialization failed: " + response.error_message());
+		return arrow::Status::Invalid(
+		    StringUtil::Format("Worker storage initialization failed: %s", response.error_message()));
 	}
 	return arrow::Status::OK();
 }
