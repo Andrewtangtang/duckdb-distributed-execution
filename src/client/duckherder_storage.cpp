@@ -27,7 +27,7 @@ unique_ptr<Catalog> DuckherderAttach(optional_ptr<StorageExtensionInfo> storage_
 	}
 	auto endpoint = ParseRemoteEndpoint(info.path);
 	distributed::StorageConfig storage_config;
-	auto storage_option = options.options.find("server_db_path");
+	auto storage_option = options.options.find("database_uri");
 	if (storage_option != options.options.end()) {
 		storage_config.set_database_uri(storage_option->second.ToString());
 	}
@@ -59,7 +59,7 @@ unique_ptr<Catalog> DuckherderAttach(optional_ptr<StorageExtensionInfo> storage_
 
 	// Remove our custom options so StorageManager doesn't validate them.
 	options.options.erase("client_role");
-	options.options.erase("server_db_path");
+	options.options.erase("database_uri");
 	options.options.erase("storage_backend");
 	options.options.erase("storage_root");
 

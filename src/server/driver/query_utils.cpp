@@ -41,15 +41,7 @@ void InitializeStorage(Connection &conn, const distributed::StorageConfig &confi
 		}
 	};
 	if (!StringUtil::StartsWith(config.database_uri(), "duckdb_objfs://")) {
-		if (config.database_uri().find("://") != string::npos || backend != "local" || !config.root().empty()) {
-			throw InvalidInputException("Native database files do not accept object storage settings or URI schemes");
-		}
-		if (!fs.IsPathAbsolute(config.database_uri())) {
-			throw InvalidInputException("Native database path must be absolute");
-		}
-		execute(StringUtil::Format("ATTACH IF NOT EXISTS %s AS object_db (READ_ONLY)",
-		                           KeywordHelper::WriteQuoted(config.database_uri())));
-		return;
+		throw InvalidInputException("Storage database URI must use duckdb_objfs://");
 	}
 	if (config.database_uri() == "duckdb_objfs://") {
 		throw InvalidInputException("Object storage database URI must name a database");

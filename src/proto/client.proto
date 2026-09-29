@@ -10,7 +10,7 @@ enum ClientRole {
 
 // Storage location shared by client attachment requests and standalone workers.
 message StorageConfig {
-  // Native database files require an absolute path.
+  // Logical DuckDB database URI using duckdb_objfs://.
   string database_uri = 1;
   // Empty selects the local backend.
   string backend = 2;
