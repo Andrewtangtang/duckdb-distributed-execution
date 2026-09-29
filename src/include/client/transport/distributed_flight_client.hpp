@@ -28,11 +28,15 @@ class DistributedFlightClient {
 public:
 	DistributedFlightClient(string server_url, distributed::ClientRole role_p,
 	                        optional_ptr<DatabaseInstance> db_instance_p = nullptr);
+	DistributedFlightClient(string server_url, distributed::ClientRole role_p,
+	                        optional_ptr<DatabaseInstance> db_instance_p,
+	                        distributed::StorageConfig storage_config_p);
 	~DistributedFlightClient();
 
 	// Connect to server.
 	arrow::Status Connect();
 	void Close();
+	arrow::Status RegisterWorker(const string &worker_id, const string &host, uint32_t port);
 	void SetTransactionContext(optional_ptr<ClientContext> context);
 	bool HasActiveTransaction();
 
@@ -92,6 +96,7 @@ private:
 	string server_url;
 	distributed::ClientRole role;
 	optional_ptr<DatabaseInstance> db_instance;
+	distributed::StorageConfig storage_config;
 	string client_id;
 	arrow::flight::Location location;
 	std::unique_ptr<arrow::flight::FlightClient> client;

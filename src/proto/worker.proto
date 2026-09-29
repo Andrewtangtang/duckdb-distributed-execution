@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package duckdb.distributed;
 
+import "client.proto";
+
 // Execute a partition on a worker node.
 message ExecutePartitionRequest {
   string sql = 1;
@@ -12,6 +14,13 @@ message ExecutePartitionRequest {
   repeated string column_names = 6;
   repeated bytes column_types = 7;
 }
+
+// Attach the driver-selected database before a worker accepts tasks.
+message InitializeWorkerRequest {
+  StorageConfig storage_config = 1;
+}
+
+message InitializeWorkerResponse {}
 
 // Partition data is returned over Arrow Flight.
 message ExecutePartitionResponse {

@@ -149,6 +149,7 @@ void DistributedFlightServer::Initialize() {
 	}
 
 	// Initialize the worker manager. Each client registration owns its connection-bound executor.
+	storage_config.Clear();
 	worker_manager = make_uniq<WorkerManager>(*db);
 }
 
@@ -160,7 +161,8 @@ void DistributedFlightServer::RegisterWorker(const string &worker_id, const stri
 	if (!worker_manager) {
 		throw InternalException("WorkerManager not initialized");
 	}
-	worker_manager->RegisterWorker(worker_id, location);
+	const concurrency::shared_lock<concurrency::shared_mutex> lock(clients_mutex);
+	worker_manager->RegisterWorker(worker_id, location, storage_config);
 }
 
 void DistributedFlightServer::RegisterOrReplaceDriver(const string &driver_id, const string &location) {
@@ -182,6 +184,8 @@ void DistributedFlightServer::StartLocalWorkers(idx_t num_workers) {
 		throw InternalException("WorkerManager not initialized");
 	}
 	worker_manager->StartLocalWorkers(num_workers);
+	const concurrency::shared_lock<concurrency::shared_mutex> lock(clients_mutex);
+	worker_manager->InitializeStorage(storage_config);
 }
 
 DistributedFlightServerTestState &DistributedFlightServer::GetTestStateForTesting() {
@@ -321,8 +325,25 @@ arrow::Status DistributedFlightServer::HandleRegisterClient(const distributed::R
 		return arrow::Status::OK();
 	}
 
+	auto requested_storage = req.storage_config();
+	if (requested_storage.backend().empty()) {
+		requested_storage.set_backend("local");
+	}
+	if (requested_storage.database_uri().empty() && requested_storage.backend() == "local" &&
+	    requested_storage.root().empty()) {
+		requested_storage = storage_config;
+	} else if (!storage_config.database_uri().empty() &&
+	           requested_storage.SerializeAsString() != storage_config.SerializeAsString()) {
+		// ponytail: one storage configuration per driver; use separate instances until per-database routing exists.
+		resp.set_success(false);
+		resp.set_error_message("Control node already has a different storage attachment configured");
+		return arrow::Status::OK();
+	}
 	auto client_id = UUID::ToString(UUID::GenerateRandomUUID());
-	clients.emplace(client_id, make_shared_ptr<ClientRegistration>(*db, *worker_manager, req.role()));
+	auto client = make_shared_ptr<ClientRegistration>(*db, *worker_manager, req.role(), requested_storage);
+	worker_manager->InitializeStorage(requested_storage);
+	clients.emplace(client_id, std::move(client));
+	storage_config = std::move(requested_storage);
 	if (req.role() == distributed::CLIENT_ROLE_READ_WRITE) {
 		writable_client_id = client_id;
 	}
@@ -482,6 +503,19 @@ arrow::Status DistributedFlightServer::DoActionImpl(const arrow::flight::ServerC
 	} else {
 		const concurrency::shared_lock<concurrency::shared_mutex> client_lock(clients_mutex);
 		switch (request.request_case()) {
+		case distributed::DistributedRequest::kWorkerRegister: {
+			// Worker registration changes cluster state and requires a writable client.
+			if (!AuthorizeClient(request.client_id(), distributed::CLIENT_ROLE_READ_WRITE, registration, response)) {
+				break;
+			}
+			const auto &req = request.worker_register();
+			ARROW_RETURN_NOT_OK(ValidateRequest(req));
+			arrow::flight::Location location;
+			ARROW_ASSIGN_OR_RAISE(location, arrow::flight::Location::ForGrpcTcp(req.host(), req.port()));
+			worker_manager->RegisterWorker(req.worker_id(), location.ToString(), storage_config);
+			response.mutable_worker_register()->set_accepted(true);
+			break;
+		}
 		case distributed::DistributedRequest::kTransaction:
 			if (AuthorizeClient(request.client_id(), distributed::CLIENT_ROLE_READ_ONLY, registration, response)) {
 				const concurrency::lock_guard<concurrency::mutex> lock(registration->connection_mutex);

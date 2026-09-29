@@ -5,9 +5,17 @@
 
 namespace duckdb {
 
-void WorkerManager::RegisterWorker(const string &worker_id, const string &location) {
-	concurrency::lock_guard<concurrency::mutex> lck(mu);
+void WorkerManager::RegisterWorker(const string &worker_id, const string &location,
+                                   const distributed::StorageConfig &storage_config) {
 	auto &db_instance = *db.instance;
+	{
+		concurrency::lock_guard<concurrency::mutex> lock(mu);
+		for (const auto &worker : workers) {
+			if (worker->worker_id == worker_id || worker->location == location) {
+				throw InvalidInputException("Worker %s at %s is already registered", worker_id, location);
+			}
+		}
+	}
 
 	auto worker_info = make_uniq<WorkerInfo>(worker_id, location);
 
@@ -16,9 +24,36 @@ void WorkerManager::RegisterWorker(const string &worker_id, const string &locati
 	if (!status.ok()) {
 		throw IOException("Failed to connect to worker %s at %s: %s", worker_id, location, status.ToString());
 	}
+	if (!storage_config.database_uri().empty()) {
+		status = worker_info->client->InitializeStorage(storage_config);
+		if (!status.ok()) {
+			throw IOException("Failed to initialize worker %s: %s", worker_id, status.ToString());
+		}
+	}
 
-	workers.emplace_back(std::move(worker_info));
+	{
+		concurrency::lock_guard<concurrency::mutex> lock(mu);
+		// Another registration may have completed while the worker was connecting.
+		for (const auto &worker : workers) {
+			if (worker->worker_id == worker_id || worker->location == location) {
+				throw InvalidInputException("Worker %s at %s is already registered", worker_id, location);
+			}
+		}
+		workers.emplace_back(std::move(worker_info));
+	}
 	DUCKDB_LOG_DEBUG(db_instance, "Successfully registered worker '%s' at '%s'", worker_id, location);
+}
+
+void WorkerManager::InitializeStorage(const distributed::StorageConfig &storage_config) {
+	if (storage_config.database_uri().empty()) {
+		return;
+	}
+	for (auto *worker : GetAvailableWorkers()) {
+		auto status = worker->client->InitializeStorage(storage_config);
+		if (!status.ok()) {
+			throw IOException("Failed to initialize worker %s: %s", worker->worker_id, status.ToString());
+		}
+	}
 }
 
 void WorkerManager::RegisterOrReplaceDriver(const string &driver_id, const string &location) {

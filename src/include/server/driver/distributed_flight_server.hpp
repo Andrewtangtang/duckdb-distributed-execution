@@ -102,6 +102,7 @@ public:
 	DistributedFlightServerTestState &GetTestStateForTesting();
 
 private:
+	distributed::StorageConfig storage_config;
 	// Implementation methods for Flight RPC handlers, without exception handling.
 	arrow::Status DoActionImpl(const arrow::flight::ServerCallContext &context, const arrow::flight::Action &action,
 	                           std::unique_ptr<arrow::flight::ResultStream> *result);

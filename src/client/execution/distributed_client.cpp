@@ -103,9 +103,10 @@ DistributedFlightClient &DistributedClient::GetClient(DistributedClientLock &) {
 	return *client;
 }
 
-DistributedClient::DistributedClient(string server_url_p, distributed::ClientRole role_p, DatabaseInstance &db_instance)
+DistributedClient::DistributedClient(string server_url_p, distributed::ClientRole role_p, DatabaseInstance &db_instance,
+                                     distributed::StorageConfig storage_config)
     : server_url(std::move(server_url_p)) {
-	client = make_uniq<DistributedFlightClient>(server_url, role_p, db_instance);
+	client = make_uniq<DistributedFlightClient>(server_url, role_p, db_instance, std::move(storage_config));
 	auto status = client->Connect();
 	if (!status.ok()) {
 		throw Exception(ExceptionType::CONNECTION,

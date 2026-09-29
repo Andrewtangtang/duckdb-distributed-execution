@@ -11,7 +11,14 @@ namespace duckdb {
 
 DistributedFlightClient::DistributedFlightClient(string server_url_p, distributed::ClientRole role_p,
                                                  optional_ptr<DatabaseInstance> db_instance_p)
-    : server_url(std::move(server_url_p)), role(role_p), db_instance(db_instance_p) {
+    : DistributedFlightClient(std::move(server_url_p), role_p, db_instance_p, {}) {
+}
+
+DistributedFlightClient::DistributedFlightClient(string server_url_p, distributed::ClientRole role_p,
+                                                 optional_ptr<DatabaseInstance> db_instance_p,
+                                                 distributed::StorageConfig storage_config_p)
+    : server_url(std::move(server_url_p)), role(role_p), db_instance(db_instance_p),
+      storage_config(std::move(storage_config_p)) {
 }
 
 DistributedFlightClient::~DistributedFlightClient() {
@@ -133,6 +140,7 @@ arrow::Status DistributedFlightClient::ResolvePendingTransaction(distributed::Di
 arrow::Status DistributedFlightClient::RegisterClient() {
 	distributed::DistributedRequest req;
 	req.mutable_register_client()->set_role(role);
+	*req.mutable_register_client()->mutable_storage_config() = storage_config;
 
 	distributed::DistributedResponse response;
 	ARROW_RETURN_NOT_OK(SendAction(req, response));
@@ -143,6 +151,21 @@ arrow::Status DistributedFlightClient::RegisterClient() {
 		return arrow::Status::Invalid("Control node returned an invalid client registration");
 	}
 	client_id = response.register_client().client_id();
+	return arrow::Status::OK();
+}
+
+arrow::Status DistributedFlightClient::RegisterWorker(const string &worker_id, const string &host,
+                                                      uint32_t port) {
+	distributed::DistributedRequest req;
+	auto *registration = req.mutable_worker_register();
+	registration->set_worker_id(worker_id);
+	registration->set_host(host);
+	registration->set_port(port);
+	distributed::DistributedResponse response;
+	ARROW_RETURN_NOT_OK(SendAction(req, response));
+	if (!response.success() || !response.has_worker_register() || !response.worker_register().accepted()) {
+		return arrow::Status::Invalid(response.error_message());
+	}
 	return arrow::Status::OK();
 }
 

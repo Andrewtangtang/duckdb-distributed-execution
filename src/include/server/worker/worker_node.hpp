@@ -4,6 +4,7 @@
 #include "duckdb.hpp"
 #include "duckdb/common/string.hpp"
 #include "duckdb/common/unique_ptr.hpp"
+#include "utils/mutex.hpp"
 
 #include <arrow/flight/api.h>
 #include <memory>
@@ -51,6 +52,8 @@ private:
 	DuckDB *db;
 	unique_ptr<DuckDB> owned_db;
 	unique_ptr<Connection> conn;
+	concurrency::mutex connection_mutex;
+	string attached_storage_config;
 };
 
 } // namespace duckdb

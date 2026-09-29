@@ -2,10 +2,15 @@
 
 #include "client/transport/distributed_flight_client.hpp"
 #include "distributed.pb.h"
+#include "duckherder_extension.hpp"
+#include "duckdb.hpp"
 #include "server/driver/distributed_flight_server.hpp"
+#include "server/driver/worker_node_client.hpp"
+#include "server/worker/worker_node.hpp"
 #include "utils/no_destructor.hpp"
 
 #include <chrono>
+#include <filesystem>
 #include <iostream>
 #include <thread>
 
@@ -47,6 +52,30 @@ FlightTestServer &GetTestServer() {
 	return *test_server;
 }
 
+class FlightTestWorker {
+public:
+	FlightTestWorker() : worker("objfs-reader", "127.0.0.1", 18816, nullptr) {
+		auto status = worker.Start();
+		if (!status.ok()) {
+			throw std::runtime_error("Failed to start worker: " + status.ToString());
+		}
+		server_thread = std::thread([this] { [[maybe_unused]] auto serve_status = worker.Serve(); });
+	}
+
+	~FlightTestWorker() {
+		worker.Shutdown();
+		server_thread.join();
+	}
+
+	string GetLocation() const {
+		return worker.GetLocation();
+	}
+
+private:
+	WorkerNode worker;
+	std::thread server_thread;
+};
+
 // Scan all batches returned by the server and count their rows.
 uint64_t CountRows(DistributedFlightClient &client, const string &table_name) {
 	vector<std::shared_ptr<arrow::RecordBatch>> batches;
@@ -72,6 +101,96 @@ TEST_CASE("Test Flight server startup and connection", "[distributed_flight]") {
 	auto status = client.Connect();
 
 	REQUIRE(status.ok());
+}
+
+TEST_CASE("Client storage config attaches a database on the driver", "[distributed_flight]") {
+	auto &server = GetTestServer().GetServer();
+	server.Reset();
+	auto path = std::filesystem::temp_directory_path() /
+	            ("duckherder_driver_attach_" +
+	             std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
+	             ".duckdb");
+	{
+		DuckDB db(path.string());
+	}
+
+	distributed::StorageConfig storage;
+	storage.set_database_uri(path.string());
+	{
+		auto missing = storage;
+		missing.set_database_uri(path.string() + ".missing");
+		DistributedFlightClient missing_reader(SERVER_URL, distributed::CLIENT_ROLE_READ_ONLY, nullptr, missing);
+		REQUIRE_FALSE(missing_reader.Connect().ok());
+		auto relative = storage;
+		relative.set_database_uri("relative.duckdb");
+		DistributedFlightClient relative_reader(SERVER_URL, distributed::CLIENT_ROLE_READ_ONLY, nullptr, relative);
+		REQUIRE(relative_reader.Connect().ToString().find("must be absolute") != std::string::npos);
+	}
+	{
+		DistributedFlightClient reader(SERVER_URL, distributed::CLIENT_ROLE_READ_ONLY, nullptr, storage);
+		REQUIRE(reader.Connect().ok());
+		DistributedFlightClient second_reader(SERVER_URL, distributed::CLIENT_ROLE_READ_ONLY, nullptr, storage);
+		REQUIRE(second_reader.Connect().ok());
+		auto different = storage;
+		different.set_database_uri(path.string() + ".other");
+		DistributedFlightClient conflicting_reader(SERVER_URL, distributed::CLIENT_ROLE_READ_ONLY, nullptr, different);
+		REQUIRE_FALSE(conflicting_reader.Connect().ok());
+	}
+	server.Reset();
+	std::filesystem::remove(path);
+}
+
+TEST_CASE("Client attach initializes an independent local ObjFS worker", "[distributed_flight]") {
+	auto &server = GetTestServer().GetServer();
+	server.Reset();
+	auto root = std::filesystem::temp_directory_path() /
+	            ("duckherder_driver_objfs_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+	std::filesystem::create_directories(root);
+	{
+		DuckDB db(nullptr);
+		Connection conn(db);
+		REQUIRE_FALSE(conn.Query("LOAD duckdb_object_storage")->HasError());
+		REQUIRE_FALSE(conn.Query("SET duckdb_objfs_backend = 'local'")->HasError());
+		REQUIRE_FALSE(conn.Query("SET duckdb_objfs_root = '" + root.string() + "'")->HasError());
+		REQUIRE_FALSE(conn.Query("ATTACH 'duckdb_objfs://shared.db' AS source")->HasError());
+		REQUIRE_FALSE(conn.Query("ATTACH 'duckdb_objfs://other.db' AS other")->HasError());
+	}
+
+	distributed::StorageConfig storage;
+	storage.set_database_uri("duckdb_objfs://shared.db");
+	storage.set_backend("local");
+	storage.set_root(root.string());
+	{
+		FlightTestWorker worker;
+		DistributedFlightClient writer(SERVER_URL, distributed::CLIENT_ROLE_READ_WRITE);
+		REQUIRE(writer.Connect().ok());
+		REQUIRE(writer.RegisterWorker("objfs-reader", "127.0.0.1", 18816).ok());
+		REQUIRE_FALSE(writer.RegisterWorker("objfs-reader", "127.0.0.1", 18816).ok());
+		REQUIRE_FALSE(writer.RegisterWorker("duplicate-location", "127.0.0.1", 18816).ok());
+		auto relative_root = storage;
+		relative_root.set_root("relative-storage");
+		DistributedFlightClient relative_reader(SERVER_URL, distributed::CLIENT_ROLE_READ_ONLY, nullptr, relative_root);
+		REQUIRE(relative_reader.Connect().ToString().find("must be an absolute path") != std::string::npos);
+
+		DuckDB client_db(nullptr);
+		client_db.LoadStaticExtension<DuckherderExtension>();
+		Connection client_conn(client_db);
+		auto attach = client_conn.Query("ATTACH 'localhost:18815' AS dh (TYPE duckherder, READ_ONLY, "
+		                                "server_db_path 'duckdb_objfs://shared.db', storage_backend 'local', "
+		                                "storage_root '" + root.string() + "')");
+		REQUIRE_FALSE(attach->HasError());
+		DistributedFlightClient reader(SERVER_URL, distributed::CLIENT_ROLE_READ_ONLY, nullptr, storage);
+		REQUIRE(reader.Connect().ok());
+		REQUIRE_FALSE(reader.RegisterWorker("second-worker", "127.0.0.1", 18817).ok());
+		REQUIRE(server.GetWorkerCount() == 1);
+		WorkerNodeClient worker_client(worker.GetLocation());
+		REQUIRE(worker_client.Connect().ok());
+		auto other = storage;
+		other.set_database_uri("duckdb_objfs://other.db");
+		REQUIRE_FALSE(worker_client.InitializeStorage(other).ok());
+	}
+	server.Reset();
+	std::filesystem::remove_all(root);
 }
 
 TEST_CASE("Expired writer lease can be reclaimed", "[distributed_flight]") {

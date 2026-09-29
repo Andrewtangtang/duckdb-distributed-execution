@@ -26,7 +26,7 @@ class DuckherderTableCatalogEntry;
 class DuckherderCatalog : public DuckCatalog {
 public:
 	DuckherderCatalog(AttachedDatabase &db, string server_host_p, int server_port_p, distributed::ClientRole role_p,
-	                  connection_t attach_connection_id_p);
+	                  connection_t attach_connection_id_p, distributed::StorageConfig storage_config_p);
 
 	~DuckherderCatalog() override;
 
@@ -80,6 +80,7 @@ private:
 	int server_port;
 	distributed::ClientRole role;
 	connection_t attach_connection_id;
+	distributed::StorageConfig storage_config;
 
 	// Per-connection remote session state.
 	string client_state_key;

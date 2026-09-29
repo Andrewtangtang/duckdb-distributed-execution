@@ -12,6 +12,23 @@ arrow::Status WorkerNodeClient::Connect() {
 	return arrow::Status::OK();
 }
 
+arrow::Status WorkerNodeClient::InitializeStorage(const distributed::StorageConfig &config) {
+	distributed::DistributedRequest request;
+	*request.mutable_initialize_worker()->mutable_storage_config() = config;
+	arrow::flight::Action action {"initialize_worker", arrow::Buffer::FromString(request.SerializeAsString())};
+	ARROW_ASSIGN_OR_RAISE(auto results, client->DoAction(action));
+	ARROW_ASSIGN_OR_RAISE(auto result, results->Next());
+	if (!result) {
+		return arrow::Status::Invalid("No initialization response from worker");
+	}
+	distributed::DistributedResponse response;
+	if (!response.ParseFromArray(result->body->data(), result->body->size()) || !response.success() ||
+	    !response.has_initialize_worker()) {
+		return arrow::Status::Invalid("Worker storage initialization failed: " + response.error_message());
+	}
+	return arrow::Status::OK();
+}
+
 arrow::Status WorkerNodeClient::ExecutePartition(const distributed::ExecutePartitionRequest &request,
                                                  std::unique_ptr<arrow::flight::FlightStreamReader> &stream) {
 	distributed::DistributedRequest req;

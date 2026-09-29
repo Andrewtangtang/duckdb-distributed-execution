@@ -1,9 +1,71 @@
 #include "server/driver/query_utils.hpp"
 
+#include "client.pb.h"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/common/exception.hpp"
+#include "duckdb/common/file_system.hpp"
+#include "duckdb/common/string.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/physical_operator.hpp"
+#include "duckdb/main/attached_database.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/main/database_manager.hpp"
+#include "duckdb/main/materialized_query_result.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 
 namespace duckdb {
+
+void InitializeStorage(Connection &conn, const distributed::StorageConfig &config) {
+	const auto backend = config.backend().empty() ? "local" : config.backend();
+	if (config.database_uri().empty()) {
+		if (!config.root().empty() || backend != "local") {
+			throw InvalidInputException("Storage settings require a database path or URI");
+		}
+		return;
+	}
+	auto &fs = FileSystem::GetFileSystem(*conn.context);
+	// IF NOT EXISTS only checks the alias; verify that it still identifies the requested read-only database.
+	auto existing = DatabaseManager::Get(*conn.context).GetDatabase("object_db");
+	if (existing) {
+		if (existing->GetCatalog().GetDBPath() != fs.CanonicalizePath(config.database_uri()) ||
+		    !existing->IsReadOnly()) {
+			throw InvalidInputException("object_db is already attached to a different database or access mode");
+		}
+	}
+
+	auto execute = [&](const string &sql) {
+		auto result = conn.Query(sql);
+		if (result->HasError()) {
+			throw IOException("Storage initialization failed: %s", result->GetError());
+		}
+	};
+	if (!StringUtil::StartsWith(config.database_uri(), "duckdb_objfs://")) {
+		if (config.database_uri().find("://") != string::npos || backend != "local" || !config.root().empty()) {
+			throw InvalidInputException("Native database files do not accept object storage settings or URI schemes");
+		}
+		if (!fs.IsPathAbsolute(config.database_uri())) {
+			throw InvalidInputException("Native database path must be absolute");
+		}
+		execute(StringUtil::Format("ATTACH IF NOT EXISTS %s AS object_db (READ_ONLY)",
+		                           KeywordHelper::WriteQuoted(config.database_uri())));
+		return;
+	}
+	if (config.database_uri() == "duckdb_objfs://") {
+		throw InvalidInputException("Object storage database URI must name a database");
+	}
+	if (backend != "local" || config.root().empty()) {
+		throw InvalidInputException("Local object storage requires the local backend and a root");
+	}
+	if (!fs.IsPathAbsolute(config.root())) {
+		throw InvalidInputException("Local object storage root must be an absolute path");
+	}
+	execute("LOAD duckdb_object_storage");
+	execute(StringUtil::Format("SET duckdb_objfs_backend = %s", KeywordHelper::WriteQuoted(backend)));
+	execute(StringUtil::Format("SET duckdb_objfs_root = %s", KeywordHelper::WriteQuoted(config.root())));
+	execute(StringUtil::Format("ATTACH IF NOT EXISTS %s AS object_db (READ_ONLY)",
+	                           KeywordHelper::WriteQuoted(config.database_uri())));
+}
 
 bool ContainsTableScan(const PhysicalOperator &op) {
 	if (op.type == PhysicalOperatorType::TABLE_SCAN) {

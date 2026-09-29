@@ -16,6 +16,7 @@ public:
 
 	// Connect to the worker.
 	arrow::Status Connect();
+	arrow::Status InitializeStorage(const distributed::StorageConfig &config);
 
 	// Execute a partitioned query task on the worker.
 	arrow::Status ExecutePartition(const distributed::ExecutePartitionRequest &request,

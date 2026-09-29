@@ -13,6 +13,7 @@
 #include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/parser/statement/logical_plan_statement.hpp"
 #include "server/worker/worker_node.hpp"
+#include "server/driver/query_utils.hpp"
 
 #include <arrow/array.h>
 #include <arrow/c/bridge.h>
@@ -72,6 +73,28 @@ arrow::Status WorkerNode::DoAction(const arrow::flight::ServerCallContext &conte
 	response.set_success(true);
 
 	switch (request.request_case()) {
+	case distributed::DistributedRequest::kInitializeWorker: {
+		const concurrency::lock_guard<concurrency::mutex> lock(connection_mutex);
+		const auto &config = request.initialize_worker().storage_config();
+		const auto requested_storage = config.SerializeAsString();
+		if (!attached_storage_config.empty() && attached_storage_config != requested_storage) {
+			return arrow::Status::Invalid("Worker is already attached to a different database");
+		}
+		if (attached_storage_config.empty() && !config.database_uri().empty()) {
+			try {
+				InitializeStorage(*conn, config);
+				auto use_result = conn->Query("USE object_db");
+				if (use_result->HasError()) {
+					return arrow::Status::Invalid(use_result->GetError());
+				}
+			} catch (const std::exception &e) {
+				return arrow::Status::Invalid(e.what());
+			}
+			attached_storage_config = requested_storage;
+		}
+		response.mutable_initialize_worker();
+		break;
+	}
 	case distributed::DistributedRequest::kExecutePartition:
 		response.mutable_execute_partition();
 		break;
@@ -110,6 +133,7 @@ arrow::Status WorkerNode::DoGet(const arrow::flight::ServerCallContext &context,
 	// Execute the partition and return results.
 	distributed::DistributedResponse response;
 	std::shared_ptr<arrow::RecordBatchReader> reader;
+	const concurrency::lock_guard<concurrency::mutex> lock(connection_mutex);
 	ARROW_RETURN_NOT_OK(HandleExecutePartition(request.execute_partition(), response, reader));
 
 	if (!reader) {

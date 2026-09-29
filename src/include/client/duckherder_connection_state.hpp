@@ -14,7 +14,8 @@ class DistributedClient;
 // Duckherder catalog. Its lifetime is tied to ClientContext::registered_state.
 class DuckherderConnectionState : public ClientContextState {
 public:
-	DuckherderConnectionState(string server_url, distributed::ClientRole role, DatabaseInstance &db_instance);
+	DuckherderConnectionState(string server_url, distributed::ClientRole role, DatabaseInstance &db_instance,
+	                         distributed::StorageConfig storage_config);
 	explicit DuckherderConnectionState(unique_ptr<DistributedClient> client);
 	~DuckherderConnectionState() override;
 

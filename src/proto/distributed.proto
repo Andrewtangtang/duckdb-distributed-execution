@@ -39,6 +39,7 @@ message DistributedRequest {
     ExecutePartitionRequest execute_partition = 15;
     WorkerRegisterRequest worker_register = 16;
     WorkerHeartbeatRequest worker_heartbeat = 17;
+    InitializeWorkerRequest initialize_worker = 23;
 
     // Monitoring.
     GetQueryExecutionStatsRequest get_query_execution_stats = 18;
@@ -73,6 +74,7 @@ message DistributedResponse {
     ExecutePartitionResponse execute_partition = 16;
     WorkerRegisterResponse worker_register = 17;
     WorkerHeartbeatResponse worker_heartbeat = 18;
+    InitializeWorkerResponse initialize_worker = 23;
 
     // Monitoring.
     GetQueryExecutionStatsResponse get_query_execution_stats = 19;

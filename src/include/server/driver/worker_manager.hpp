@@ -31,7 +31,9 @@ public:
 	}
 
 	// Register a single external worker node.
-	void RegisterWorker(const string &worker_id, const string &location);
+	void RegisterWorker(const string &worker_id, const string &location,
+	                    const distributed::StorageConfig &storage_config);
+	void InitializeStorage(const distributed::StorageConfig &storage_config);
 
 	// Register or replace the driver node.
 	// Unlike workers, only one driver node can be registered at a time.

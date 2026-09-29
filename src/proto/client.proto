@@ -8,9 +8,21 @@ enum ClientRole {
   CLIENT_ROLE_READ_WRITE = 2;
 }
 
+// Storage location shared by client attachment requests and standalone workers.
+message StorageConfig {
+  // Native database files require an absolute path.
+  string database_uri = 1;
+  // Empty selects the local backend.
+  string backend = 2;
+  // Local ObjFS requires an absolute root path.
+  string root = 3;
+}
+
 // Register a Duckherder attachment with the control node.
 message RegisterClientRequest {
   ClientRole role = 1;
+  // Optional database attachment initialized on the control node for this session.
+  StorageConfig storage_config = 2;
 }
 
 message RegisterClientResponse {

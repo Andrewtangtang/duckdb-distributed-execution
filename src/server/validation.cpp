@@ -3,6 +3,7 @@
 #include "client.pb.h"
 #include "distributed.pb.h"
 #include "transaction.pb.h"
+#include "worker.pb.h"
 
 namespace duckdb {
 
@@ -29,6 +30,13 @@ arrow::Status ValidateRequest(const distributed::TransactionRequest &request) {
 	default:
 		return arrow::Status::Invalid("Transaction action must be BEGIN, COMMIT, or ROLLBACK");
 	}
+}
+
+arrow::Status ValidateRequest(const distributed::WorkerRegisterRequest &request) {
+	if (request.worker_id().empty() || request.host().empty() || request.port() == 0 || request.port() > 65535) {
+		return arrow::Status::Invalid("Worker registration requires an ID, host, and valid port");
+	}
+	return arrow::Status::OK();
 }
 
 } // namespace duckdb
