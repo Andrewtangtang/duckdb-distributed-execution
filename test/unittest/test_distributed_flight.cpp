@@ -105,7 +105,8 @@ TEST_CASE("Test Flight server startup and connection", "[distributed_flight]") {
 	DistributedFlightClient client(SERVER_URL, distributed::CLIENT_ROLE_READ_WRITE);
 	auto status = client.Connect();
 
-	REQUIRE(status.ok());
+	REQUIRE_FALSE(status.ok());
+	REQUIRE(status.ToString().find("storage database URI") != std::string::npos);
 }
 
 TEST_CASE("Client attach initializes an independent local ObjFS worker", "[distributed_flight]") {
@@ -134,23 +135,28 @@ TEST_CASE("Client attach initializes an independent local ObjFS worker", "[distr
 		native.set_database_uri("/tmp/native.duckdb");
 		DistributedFlightClient native_reader(SERVER_URL, distributed::CLIENT_ROLE_READ_ONLY, nullptr, native);
 		REQUIRE(native_reader.Connect().ToString().find("duckdb_objfs://") != std::string::npos);
-		FlightTestWorker worker;
-		DistributedFlightClient writer(SERVER_URL, distributed::CLIENT_ROLE_READ_WRITE);
-		REQUIRE(writer.Connect().ok());
-		REQUIRE(writer.RegisterWorker("objfs-reader", "127.0.0.1", 18816).ok());
-		REQUIRE_FALSE(writer.RegisterWorker("objfs-reader", "127.0.0.1", 18816).ok());
-		REQUIRE_FALSE(writer.RegisterWorker("duplicate-location", "127.0.0.1", 18816).ok());
 		auto relative_root = storage;
 		relative_root.set_root("relative-storage");
 		DistributedFlightClient relative_reader(SERVER_URL, distributed::CLIENT_ROLE_READ_ONLY, nullptr, relative_root);
 		REQUIRE(relative_reader.Connect().ToString().find("must be an absolute path") != std::string::npos);
-
+		FlightTestWorker worker;
+		DistributedFlightClient writer(SERVER_URL, distributed::CLIENT_ROLE_READ_WRITE, nullptr, storage);
+		REQUIRE(writer.Connect().ok());
+		REQUIRE(writer.RegisterWorker("objfs-reader", "127.0.0.1", 18816).ok());
+		REQUIRE_FALSE(writer.RegisterWorker("objfs-reader", "127.0.0.1", 18816).ok());
+		REQUIRE_FALSE(writer.RegisterWorker("duplicate-location", "127.0.0.1", 18816).ok());
 		DuckDB client_db(nullptr);
 		client_db.LoadStaticExtension<DuckherderExtension>();
 		Connection client_conn(client_db);
+		auto missing_name = client_conn.Query(StringUtil::Format(
+		    "ATTACH 'localhost:18815' AS missing_name (TYPE duckherder, DATA_PATH '%s')", root.string()));
+		REQUIRE(missing_name->HasError());
+		REQUIRE(missing_name->GetError().find("requires a database name") != std::string::npos);
+		auto missing_storage = client_conn.Query("ATTACH 'localhost:18815/shared.db' AS missing (TYPE duckherder)");
+		REQUIRE(missing_storage->HasError());
+		REQUIRE(missing_storage->GetError().find("requires DATA_PATH") != std::string::npos);
 		auto attach = client_conn.Query(StringUtil::Format(
-		    "ATTACH 'localhost:18815' AS dh (TYPE duckherder, READ_ONLY, "
-		    "database_uri 'duckdb_objfs://shared.db', storage_backend 'local', storage_root '%s')",
+		    "ATTACH 'localhost:18815/shared.db' AS dh (TYPE duckherder, READ_ONLY, DATA_PATH '%s')",
 		    root.string()));
 		REQUIRE_FALSE(attach->HasError());
 		DistributedFlightClient reader(SERVER_URL, distributed::CLIENT_ROLE_READ_ONLY, nullptr, storage);

@@ -18,6 +18,15 @@ RemoteEndpoint ParseRemoteEndpoint(const string &path) {
 	} else if (endpoint.find("://") != string::npos) {
 		throw InvalidInputException("Duckherder ATTACH only supports grpc:// endpoints");
 	}
+	auto database_separator = endpoint.find('/');
+	string database_name;
+	if (database_separator != string::npos) {
+		database_name = endpoint.substr(database_separator + 1);
+		if (database_name.empty() || database_name.find('/') != string::npos) {
+			throw InvalidInputException("Invalid Duckherder database name in '%s'", path);
+		}
+		endpoint = endpoint.substr(0, database_separator);
+	}
 
 	idx_t port_separator;
 	if (!endpoint.empty() && endpoint[0] == '[') {
@@ -42,7 +51,7 @@ RemoteEndpoint ParseRemoteEndpoint(const string &path) {
 	    parse_result.ptr != port_text.data() + port_text.size() || port < 1 || port > 65535) {
 		throw InvalidInputException("Invalid Duckherder endpoint '%s'; expected 'host:port' with a valid port", path);
 	}
-	return {std::move(host), port};
+	return {.host = std::move(host), .port = port, .database_name = std::move(database_name)};
 }
 
 } // namespace duckdb

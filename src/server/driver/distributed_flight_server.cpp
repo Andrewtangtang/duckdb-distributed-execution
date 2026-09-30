@@ -144,6 +144,10 @@ void DistributedFlightServer::Initialize() {
 	// Loadable extensions use DuckDB's dummy loader, so initialize core functions explicitly.
 	db->LoadStaticExtension<CoreFunctionsExtension>();
 	Connection bootstrap_conn(*db);
+	auto objfs_result = bootstrap_conn.Query("LOAD duckdb_object_storage");
+	if (objfs_result->HasError()) {
+		throw InternalException(StringUtil::Format("Failed to load object storage: %s", objfs_result->GetError()));
+	}
 
 	// Attach duckling storage extension.
 	auto result = bootstrap_conn.Query("ATTACH DATABASE ':memory:' AS duckling (TYPE duckling);");
@@ -332,11 +336,8 @@ arrow::Status DistributedFlightServer::HandleRegisterClient(const distributed::R
 	if (requested_storage.backend().empty()) {
 		requested_storage.set_backend("local");
 	}
-	if (requested_storage.database_uri().empty() && requested_storage.backend() == "local" &&
-	    requested_storage.root().empty()) {
-		requested_storage = storage_config;
-	} else if (!storage_config.database_uri().empty() &&
-	           requested_storage.SerializeAsString() != storage_config.SerializeAsString()) {
+	if (!storage_config.database_uri().empty() &&
+	    requested_storage.SerializeAsString() != storage_config.SerializeAsString()) {
 		// ponytail: one storage configuration per driver; use separate instances until per-database routing exists.
 		resp.set_success(false);
 		resp.set_error_message("Control node already has a different storage attachment configured");

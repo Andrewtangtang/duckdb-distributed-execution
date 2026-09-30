@@ -7,6 +7,7 @@ namespace duckdb {
 struct RemoteEndpoint {
 	string host;
 	int port;
+	string database_name;
 };
 
 RemoteEndpoint ParseRemoteEndpoint(const string &path);

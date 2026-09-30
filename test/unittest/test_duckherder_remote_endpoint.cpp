@@ -10,6 +10,14 @@ TEST_CASE("Parse Duckherder remote endpoints", "[duckherder][endpoint]") {
 		auto endpoint = ParseRemoteEndpoint("localhost:8815");
 		REQUIRE(endpoint.host == "localhost");
 		REQUIRE(endpoint.port == 8815);
+		REQUIRE(endpoint.database_name.empty());
+	}
+
+	SECTION("Database name") {
+		auto endpoint = ParseRemoteEndpoint("localhost:8815/shared.db");
+		REQUIRE(endpoint.host == "localhost");
+		REQUIRE(endpoint.port == 8815);
+		REQUIRE(endpoint.database_name == "shared.db");
 	}
 
 	SECTION("Explicit gRPC scheme") {
@@ -29,6 +37,7 @@ TEST_CASE("Reject invalid Duckherder remote endpoints", "[duckherder][endpoint]"
 	const char *invalid_endpoints[] {
 	    ":memory:",    "local.duckdb",    "http://localhost:8815", "localhost", "localhost:",
 	    "localhost:0", "localhost:65536", "localhost:abc",         "::1:8815",  "grpc://localhost",
+	    "localhost:8815/", "localhost:8815/db/extra",
 	};
 
 	for (const auto &endpoint : invalid_endpoints) {

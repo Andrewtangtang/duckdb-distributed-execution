@@ -34,6 +34,13 @@ WorkerNode::WorkerNode(string worker_id_p, string host_p, int port_p, DuckDB *sh
 	// Standalone workers also need core functions when created from a loadable extension.
 	db->LoadStaticExtension<CoreFunctionsExtension>();
 	conn = make_uniq<Connection>(*db);
+	if (owned_db) {
+		auto objfs_result = conn->Query("LOAD duckdb_object_storage");
+		if (objfs_result->HasError()) {
+			throw InternalException(StringUtil::Format("Worker %s failed to load object storage: %s", worker_id,
+			                                           objfs_result->GetError()));
+		}
+	}
 
 	// If using shared DB, set the default catalog to "duckling" to match the server.
 	if (shared_db != nullptr) {

@@ -52,7 +52,6 @@ void InitializeStorage(Connection &conn, const distributed::StorageConfig &confi
 	if (!fs.IsPathAbsolute(config.root())) {
 		throw InvalidInputException("Local object storage root must be an absolute path");
 	}
-	execute("LOAD duckdb_object_storage");
 	execute(StringUtil::Format("SET duckdb_objfs_backend = %s", KeywordHelper::WriteQuoted(backend)));
 	execute(StringUtil::Format("SET duckdb_objfs_root = %s", KeywordHelper::WriteQuoted(config.root())));
 	execute(StringUtil::Format("ATTACH IF NOT EXISTS %s AS object_db (READ_ONLY)",
