@@ -93,7 +93,7 @@ arrow::Status WorkerNode::DoAction(const arrow::flight::ServerCallContext &conte
 		}
 		if (attached_storage_config.empty() && !config.database_uri().empty()) {
 			try {
-				InitializeStorage(*conn, config);
+				InitializeStorage(*conn, config, /*read_only=*/true);
 				auto use_result = conn->Query("USE object_db");
 				if (use_result->HasError()) {
 					return arrow::Status::Invalid(use_result->GetError());

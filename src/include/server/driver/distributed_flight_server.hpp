@@ -182,6 +182,8 @@ private:
 	string host;
 	int port;
 	unique_ptr<DuckDB> db;
+	// Readers need a read-only database instance while the client-selected writer remains writable.
+	unique_ptr<DuckDB> writer_db;
 	unique_ptr<WorkerManager> worker_manager;
 
 	// Client admission: at most one writable attachment, with any number of readers.

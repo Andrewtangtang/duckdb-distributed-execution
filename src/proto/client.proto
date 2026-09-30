@@ -21,7 +21,7 @@ message StorageConfig {
 // Register a Duckherder attachment with the control node.
 message RegisterClientRequest {
   ClientRole role = 1;
-  // Database attachment initialized on the control node for this session.
+  // Optional database attachment initialized on the control node for this session.
   StorageConfig storage_config = 2;
 }
 

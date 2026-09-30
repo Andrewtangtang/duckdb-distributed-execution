@@ -105,11 +105,10 @@ TEST_CASE("Test Flight server startup and connection", "[distributed_flight]") {
 	DistributedFlightClient client(SERVER_URL, distributed::CLIENT_ROLE_READ_WRITE);
 	auto status = client.Connect();
 
-	REQUIRE_FALSE(status.ok());
-	REQUIRE(status.ToString().find("storage database URI") != std::string::npos);
+	REQUIRE(status.ok());
 }
 
-TEST_CASE("Client attach initializes an independent local ObjFS worker", "[distributed_flight]") {
+TEST_CASE("Local ObjFS supports a driver writer and independent readers", "[distributed_flight]") {
 	auto &server = GetTestServer().GetServer();
 	server.Reset();
 	auto root = std::filesystem::temp_directory_path() /
@@ -142,6 +141,8 @@ TEST_CASE("Client attach initializes an independent local ObjFS worker", "[distr
 		FlightTestWorker worker;
 		DistributedFlightClient writer(SERVER_URL, distributed::CLIENT_ROLE_READ_WRITE, nullptr, storage);
 		REQUIRE(writer.Connect().ok());
+		ExecuteAutocommit(writer, "CREATE TABLE writer_items (id INTEGER)");
+		ExecuteAutocommit(writer, "INSERT INTO writer_items VALUES (1), (2)");
 		REQUIRE(writer.RegisterWorker("objfs-reader", "127.0.0.1", 18816).ok());
 		REQUIRE_FALSE(writer.RegisterWorker("objfs-reader", "127.0.0.1", 18816).ok());
 		REQUIRE_FALSE(writer.RegisterWorker("duplicate-location", "127.0.0.1", 18816).ok());
@@ -161,13 +162,48 @@ TEST_CASE("Client attach initializes an independent local ObjFS worker", "[distr
 		REQUIRE_FALSE(attach->HasError());
 		DistributedFlightClient reader(SERVER_URL, distributed::CLIENT_ROLE_READ_ONLY, nullptr, storage);
 		REQUIRE(reader.Connect().ok());
+		REQUIRE(CountRows(reader, "writer_items") == 2);
+		vector<std::shared_ptr<arrow::RecordBatch>> rejected_batches;
+		REQUIRE_FALSE(reader.ScanTable("CREATE TABLE injected AS SELECT 1", 100, 0, rejected_batches).ok());
+		distributed::DistributedResponse write_response;
+		auto write_status = reader.ExecuteStatement("INSERT INTO writer_items VALUES (9)", "", write_response);
+		const bool write_succeeded = write_status.ok() && write_response.success();
+		REQUIRE_FALSE(write_succeeded);
+		REQUIRE(CountRows(writer, "writer_items") == 2);
 		REQUIRE_FALSE(reader.RegisterWorker("second-worker", "127.0.0.1", 18817).ok());
 		REQUIRE(server.GetWorkerCount() == 1);
 		WorkerNodeClient worker_client(worker.GetLocation());
 		REQUIRE(worker_client.Connect().ok());
+		distributed::ExecutePartitionRequest partition;
+		partition.set_sql("SELECT id FROM writer_items");
+		std::unique_ptr<arrow::flight::FlightStreamReader> stream;
+		REQUIRE(worker_client.ExecutePartition(partition, stream).ok());
+		auto batch = stream->Next();
+		REQUIRE(batch.ok());
+		REQUIRE(batch.ValueOrDie().data);
+		REQUIRE(batch.ValueOrDie().data->num_rows() == 2);
 		auto other = storage;
 		other.set_database_uri("duckdb_objfs://other.db");
 		REQUIRE_FALSE(worker_client.InitializeStorage(other).ok());
+	}
+	server.Reset();
+	{
+		DuckDB client_db(nullptr);
+		client_db.LoadStaticExtension<DuckherderExtension>();
+		Connection client_conn(client_db);
+		auto attach = client_conn.Query(StringUtil::Format(
+		    "ATTACH 'localhost:18815/shared.db' AS dh (TYPE duckherder, DATA_PATH '%s')", root.string()));
+		REQUIRE_FALSE(attach->HasError());
+		REQUIRE_FALSE(client_conn.Query("INSERT INTO dh.writer_items VALUES (3)")->HasError());
+	}
+	server.Reset();
+	{
+		DistributedFlightClient first_reader(SERVER_URL, distributed::CLIENT_ROLE_READ_ONLY, nullptr, storage);
+		REQUIRE(first_reader.Connect().ok());
+		DistributedFlightClient late_writer(SERVER_URL, distributed::CLIENT_ROLE_READ_WRITE, nullptr, storage);
+		REQUIRE(late_writer.Connect().ok());
+		ExecuteAutocommit(late_writer, "INSERT INTO writer_items VALUES (4)");
+		REQUIRE(CountRows(late_writer, "writer_items") == 4);
 	}
 	server.Reset();
 	std::filesystem::remove_all(root);

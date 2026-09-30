@@ -16,7 +16,7 @@
 
 namespace duckdb {
 
-void InitializeStorage(Connection &conn, const distributed::StorageConfig &config) {
+void InitializeStorage(Connection &conn, const distributed::StorageConfig &config, bool read_only) {
 	const auto backend = config.backend().empty() ? "local" : config.backend();
 	if (config.database_uri().empty()) {
 		if (!config.root().empty() || backend != "local") {
@@ -25,11 +25,11 @@ void InitializeStorage(Connection &conn, const distributed::StorageConfig &confi
 		return;
 	}
 	auto &fs = FileSystem::GetFileSystem(*conn.context);
-	// IF NOT EXISTS only checks the alias; verify that it still identifies the requested read-only database.
+	// IF NOT EXISTS only checks the alias; verify that it still identifies the requested database.
 	auto existing = DatabaseManager::Get(*conn.context).GetDatabase("object_db");
 	if (existing) {
 		if (existing->GetCatalog().GetDBPath() != fs.CanonicalizePath(config.database_uri()) ||
-		    !existing->IsReadOnly()) {
+		    existing->IsReadOnly() != read_only) {
 			throw InvalidInputException("object_db is already attached to a different database or access mode");
 		}
 	}
@@ -52,10 +52,13 @@ void InitializeStorage(Connection &conn, const distributed::StorageConfig &confi
 	if (!fs.IsPathAbsolute(config.root())) {
 		throw InvalidInputException("Local object storage root must be an absolute path");
 	}
+	if (existing) {
+		return;
+	}
 	execute(StringUtil::Format("SET duckdb_objfs_backend = %s", KeywordHelper::WriteQuoted(backend)));
 	execute(StringUtil::Format("SET duckdb_objfs_root = %s", KeywordHelper::WriteQuoted(config.root())));
-	execute(StringUtil::Format("ATTACH IF NOT EXISTS %s AS object_db (READ_ONLY)",
-	                           KeywordHelper::WriteQuoted(config.database_uri())));
+	execute(StringUtil::Format("ATTACH IF NOT EXISTS %s AS object_db%s",
+	                           KeywordHelper::WriteQuoted(config.database_uri()), read_only ? " (READ_ONLY)" : ""));
 }
 
 bool ContainsTableScan(const PhysicalOperator &op) {

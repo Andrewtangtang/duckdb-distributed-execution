@@ -1,6 +1,6 @@
-#include "core_functions_extension.hpp"
 #include "server/driver/distributed_flight_server.hpp"
 
+#include "core_functions_extension.hpp"
 #include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
@@ -128,6 +128,7 @@ void DistributedFlightServer::Reset() {
 void DistributedFlightServer::Initialize() {
 	// Release objects that reference the previous database in dependency order.
 	worker_manager.reset();
+	writer_db.reset();
 	db.reset();
 
 	// Clear query history.
@@ -336,15 +337,31 @@ arrow::Status DistributedFlightServer::HandleRegisterClient(const distributed::R
 	if (requested_storage.backend().empty()) {
 		requested_storage.set_backend("local");
 	}
-	if (!storage_config.database_uri().empty() &&
-	    requested_storage.SerializeAsString() != storage_config.SerializeAsString()) {
+	if (requested_storage.database_uri().empty() && requested_storage.root().empty() &&
+	    requested_storage.backend() == "local") {
+		requested_storage = storage_config;
+	} else if (!storage_config.database_uri().empty() &&
+	           requested_storage.SerializeAsString() != storage_config.SerializeAsString()) {
 		// ponytail: one storage configuration per driver; use separate instances until per-database routing exists.
 		resp.set_success(false);
 		resp.set_error_message("Control node already has a different storage attachment configured");
 		return arrow::Status::OK();
 	}
 	auto client_id = UUID::ToString(UUID::GenerateRandomUUID());
-	auto client = make_shared_ptr<ClientRegistration>(*db, *worker_manager, req.role(), requested_storage);
+	auto *client_db = db.get();
+	if (req.role() == distributed::CLIENT_ROLE_READ_WRITE && !requested_storage.database_uri().empty()) {
+		if (!writer_db) {
+			writer_db = make_uniq<DuckDB>(nullptr, nullptr);
+			writer_db->LoadStaticExtension<CoreFunctionsExtension>();
+			Connection bootstrap_conn(*writer_db);
+			auto result = bootstrap_conn.Query("LOAD duckdb_object_storage");
+			if (result->HasError()) {
+				throw InternalException(StringUtil::Format("Failed to load writer object storage: %s", result->GetError()));
+			}
+		}
+		client_db = writer_db.get();
+	}
+	auto client = make_shared_ptr<ClientRegistration>(*client_db, *worker_manager, req.role(), requested_storage);
 	worker_manager->InitializeStorage(requested_storage);
 	clients.emplace(client_id, std::move(client));
 	storage_config = std::move(requested_storage);

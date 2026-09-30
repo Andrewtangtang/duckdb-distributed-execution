@@ -18,9 +18,6 @@ arrow::Status ValidateRequest(const distributed::RegisterClientRequest &request)
 	if (request.role() != distributed::CLIENT_ROLE_READ_ONLY && request.role() != distributed::CLIENT_ROLE_READ_WRITE) {
 		return arrow::Status::Invalid("Duckherder client role must be specified");
 	}
-	if (!request.has_storage_config() || request.storage_config().database_uri().empty()) {
-		return arrow::Status::Invalid("Client registration requires a storage database URI");
-	}
 	return arrow::Status::OK();
 }
 

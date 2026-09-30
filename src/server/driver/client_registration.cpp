@@ -13,7 +13,7 @@ namespace duckdb {
 ClientRegistration::ClientRegistration(DuckDB &db, WorkerManager &worker_manager, distributed::ClientRole role_p,
                                        const distributed::StorageConfig &storage_config)
     : role(role_p), last_seen(GetSteadyNowMilliSecSinceEpoch()), connection(make_uniq<Connection>(db)) {
-	InitializeStorage(*connection, storage_config);
+	InitializeStorage(*connection, storage_config, /*read_only=*/role == distributed::CLIENT_ROLE_READ_ONLY);
 	auto use_result = connection->Query(storage_config.database_uri().empty() ? "USE duckling" : "USE object_db");
 	if (use_result->HasError()) {
 		throw InternalException(

@@ -26,17 +26,20 @@ unique_ptr<Catalog> DuckherderAttach(optional_ptr<StorageExtensionInfo> storage_
 		    "ATTACH path, for example ATTACH 'localhost:8815/shared.db' (TYPE duckherder, DATA_PATH '/tmp/storage')");
 	}
 	auto endpoint = ParseRemoteEndpoint(info.path);
-	if (endpoint.database_name.empty()) {
-		throw InvalidInputException("Duckherder ATTACH requires a database name in the endpoint path");
-	}
 	distributed::StorageConfig storage_config;
 	auto storage_option = options.options.find("data_path");
-	if (storage_option == options.options.end() || storage_option->second.ToString().empty()) {
-		throw InvalidInputException("Duckherder ATTACH requires DATA_PATH");
+	if (endpoint.database_name.empty()) {
+		if (storage_option != options.options.end()) {
+			throw InvalidInputException("Duckherder ATTACH requires a database name in the endpoint path");
+		}
+	} else {
+		if (storage_option == options.options.end() || storage_option->second.ToString().empty()) {
+			throw InvalidInputException("Duckherder ATTACH requires DATA_PATH");
+		}
+		storage_config.set_database_uri(StringUtil::Format("duckdb_objfs://%s", endpoint.database_name));
+		storage_config.set_backend("local");
+		storage_config.set_root(storage_option->second.ToString());
 	}
-	storage_config.set_database_uri(StringUtil::Format("duckdb_objfs://%s", endpoint.database_name));
-	storage_config.set_backend("local");
-	storage_config.set_root(storage_option->second.ToString());
 	const bool attach_read_only = options.access_mode == AccessMode::READ_ONLY;
 	auto role = attach_read_only ? distributed::CLIENT_ROLE_READ_ONLY : distributed::CLIENT_ROLE_READ_WRITE;
 
