@@ -5,6 +5,10 @@
 #include "duckherder_extension.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/transaction/duck_transaction.hpp"
+#include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "server/driver/distributed_flight_server.hpp"
 #include "server/driver/worker_node_client.hpp"
 #include "server/worker/worker_node.hpp"
@@ -453,4 +457,20 @@ TEST_CASE("Test error handling in protobuf responses", "[distributed_flight]") {
 	REQUIRE(status.ok());
 	REQUIRE_FALSE(response.success());
 	REQUIRE_FALSE(response.error_message().empty());
+}
+
+TEST_CASE("Duckling storage sees the active transaction manager", "[distributed_flight][transaction]") {
+	Connection connection(GetTestServer().GetServer().GetDatabaseInstance());
+	REQUIRE_FALSE(connection.Query("USE duckling")->HasError());
+	connection.BeginTransaction();
+	auto &catalog = Catalog::GetCatalog(*connection.context, "duckling");
+	auto &transaction = DuckTransaction::Get(*connection.context, catalog);
+	auto &manager = DuckTransactionManager::Get(catalog.GetAttached());
+
+	// CREATE INDEX obtains its visibility bounds through the attached database.
+	// They must come from the manager that actually started this transaction.
+	REQUIRE(&transaction.GetTransactionManager() == &manager);
+	REQUIRE(manager.LowestActiveStart() == transaction.start_time);
+	REQUIRE(manager.LowestActiveId() == transaction.transaction_id);
+	connection.Rollback();
 }
