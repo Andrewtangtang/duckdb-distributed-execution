@@ -48,12 +48,17 @@ public:
 	                             PhysicalOperator &plan) override;
 	PhysicalOperator &PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
 	                             PhysicalOperator &plan) override;
-	// Forwards INSERT ... ON CONFLICT and INSERT OR REPLACE to the control node.
+	// Forwards MERGE, INSERT ... ON CONFLICT, and INSERT OR REPLACE to the control node.
 	PhysicalOperator &PlanMergeInto(ClientContext &context, PhysicalPlanGenerator &planner, LogicalMergeInto &op,
 	                                PhysicalOperator &plan) override;
 
 	unique_ptr<LogicalOperator> BindCreateIndex(Binder &binder, CreateStatement &stmt, TableCatalogEntry &table,
 	                                            unique_ptr<LogicalOperator> plan) override;
+	// Routes ADD PRIMARY KEY to the control node without building a client-side index over a remote scan.
+	unique_ptr<LogicalOperator> BindAlterAddIndex(Binder &binder, TableCatalogEntry &table_entry,
+	                                             unique_ptr<LogicalOperator> plan,
+	                                             unique_ptr<CreateIndexInfo> create_info,
+	                                             unique_ptr<AlterTableInfo> alter_info) override;
 
 	void DropSchema(ClientContext &context, DropInfo &info) override;
 

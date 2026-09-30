@@ -4,9 +4,12 @@
 
 #include "duckdb/catalog/catalog_entry/duck_index_entry.hpp"
 #include "duckdb/catalog/catalog_entry/duck_schema_entry.hpp"
+#include "duckdb/common/algorithm.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/logging/logger.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/parsed_data/create_index_info.hpp"
 #include "duckdb/parser/parsed_data/create_macro_info.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
@@ -46,6 +49,46 @@ unique_ptr<CatalogEntry> DuckherderSchemaCatalogEntry::Copy(ClientContext &conte
 	throw NotImplementedException("Altering Duckherder schemas is not supported");
 }
 
+void DuckherderSchemaCatalogEntry::Scan(ClientContext &context, CatalogType type,
+                                        const std::function<void(CatalogEntry &)> &callback) {
+	DuckSchemaEntry::Scan(context, type, [&](CatalogEntry &entry) {
+		if (entry.type != CatalogType::TABLE_ENTRY) {
+			callback(entry);
+			return;
+		}
+		EntryLookupInfoKey key {
+		    .type = CatalogType::TABLE_ENTRY,
+		    .name = entry.name,
+		};
+		CatalogEntry *wrapped_entry = nullptr;
+		{
+			concurrency::lock_guard<concurrency::mutex> lck(mu);
+			wrapped_entry = WrapAndCacheTableCatalogEntryWithLock(std::move(key), &entry);
+		}
+		callback(*wrapped_entry);
+	});
+}
+
+void DuckherderSchemaCatalogEntry::Scan(CatalogType type,
+                                        const std::function<void(CatalogEntry &)> &callback) {
+	DuckSchemaEntry::Scan(type, [&](CatalogEntry &entry) {
+		if (entry.type != CatalogType::TABLE_ENTRY) {
+			callback(entry);
+			return;
+		}
+		EntryLookupInfoKey key {
+		    .type = CatalogType::TABLE_ENTRY,
+		    .name = entry.name,
+		};
+		CatalogEntry *wrapped_entry = nullptr;
+		{
+			concurrency::lock_guard<concurrency::mutex> lck(mu);
+			wrapped_entry = WrapAndCacheTableCatalogEntryWithLock(std::move(key), &entry);
+		}
+		callback(*wrapped_entry);
+	});
+}
+
 optional_ptr<CatalogEntry> DuckherderSchemaCatalogEntry::CreateIndex(CatalogTransaction transaction,
                                                                      CreateIndexInfo &info, TableCatalogEntry &table) {
 	DUCKDB_LOG_DEBUG(db_instance, "DuckherderSchemaCatalogEntry::CreateIndex");
@@ -68,6 +111,49 @@ optional_ptr<CatalogEntry> DuckherderSchemaCatalogEntry::CreateIndex(CatalogTran
 	auto *result = remote_index.get();
 	if (!AddEntryInternal(std::move(transaction), std::move(remote_index), info.on_conflict, dependencies)) {
 		return nullptr;
+	}
+	AddRemoteIndex(table, info);
+	return result;
+}
+
+void DuckherderSchemaCatalogEntry::AddRemoteIndex(TableCatalogEntry &table, const CreateIndexInfo &info) {
+	IndexInfo index_info;
+	index_info.is_unique =
+	    info.constraint_type == IndexConstraintType::UNIQUE || info.constraint_type == IndexConstraintType::PRIMARY;
+	index_info.is_primary = info.constraint_type == IndexConstraintType::PRIMARY;
+	index_info.is_foreign = info.constraint_type == IndexConstraintType::FOREIGN;
+	index_info.column_set.insert(info.column_ids.begin(), info.column_ids.end());
+	auto add_expression_columns = [&](const auto &expressions) {
+		for (auto &expression : expressions) {
+			ParsedExpressionIterator::VisitExpression<ColumnRefExpression>(
+			    *expression, [&](const ColumnRefExpression &column_ref) {
+				auto column_name = column_ref.GetColumnName();
+				auto logical_index = table.GetColumnIndex(column_name);
+				index_info.column_set.insert(table.GetColumns().GetColumn(logical_index).Physical().index);
+			});
+		}
+	};
+	if (index_info.column_set.empty()) {
+		add_expression_columns(info.expressions);
+	}
+	if (index_info.column_set.empty()) {
+		add_expression_columns(info.parsed_expressions);
+	}
+
+	concurrency::lock_guard<concurrency::mutex> lck(mu);
+	remote_indexes[table.name].push_back({info.index_name, std::move(index_info)});
+}
+
+vector<IndexInfo> DuckherderSchemaCatalogEntry::GetRemoteIndexes(const string &table_name) {
+	concurrency::lock_guard<concurrency::mutex> lck(mu);
+	auto entry = remote_indexes.find(table_name);
+	if (entry == remote_indexes.end()) {
+		return {};
+	}
+	vector<IndexInfo> result;
+	result.reserve(entry->second.size());
+	for (auto &index : entry->second) {
+		result.push_back(index.info);
 	}
 	return result;
 }
@@ -254,6 +340,14 @@ void DuckherderSchemaCatalogEntry::DropRemoteIndex(ClientContext &context, const
 	if (result->HasError()) {
 		throw CatalogException("Failed to drop remote index on server: %s", result->GetError());
 	}
+
+	concurrency::lock_guard<concurrency::mutex> lck(mu);
+	for (auto &table_indexes : remote_indexes) {
+		auto &indexes = table_indexes.second;
+		indexes.erase(std::remove_if(indexes.begin(), indexes.end(),
+		                             [&](const RemoteIndexMetadata &index) { return index.name == info.name; }),
+		              indexes.end());
+	}
 }
 
 void DuckherderSchemaCatalogEntry::DropRemoteTable(ClientContext &context, const DropInfo &info) {
@@ -275,6 +369,10 @@ void DuckherderSchemaCatalogEntry::DropRemoteTable(ClientContext &context, const
 		throw CatalogException("Failed to drop remote table on server: %s", result->GetError());
 	}
 
+	{
+		concurrency::lock_guard<concurrency::mutex> lck(mu);
+		remote_indexes.erase(info.name);
+	}
 	if (duckherder_catalog.IsRemoteTable(name, info.name)) {
 		duckherder_catalog.UnregisterRemoteTable(info.name);
 	}
@@ -298,6 +396,24 @@ void DuckherderSchemaCatalogEntry::DropRemoteView(ClientContext &context, const 
 	}
 }
 
+void DuckherderSchemaCatalogEntry::DropRemoteType(ClientContext &context, const DropInfo &info) {
+	DUCKDB_LOG_DEBUG(db_instance, StringUtil::Format("Dropping remote type: %s", info.name));
+
+	auto schema_name = KeywordHelper::WriteQuoted(name, '"');
+	auto type_name = KeywordHelper::WriteQuoted(info.name, '"');
+	auto if_exists = info.if_not_found == OnEntryNotFound::THROW_EXCEPTION ? "" : "IF EXISTS ";
+	auto drop_sql = StringUtil::Format("DROP TYPE %s%s.%s", if_exists, schema_name, type_name);
+	if (info.cascade) {
+		drop_sql += " CASCADE";
+	}
+
+	auto &client = duckherder_catalog.GetClient(context);
+	auto result = client.ExecuteStatement(drop_sql, StatementType::DROP_STATEMENT);
+	if (result->HasError()) {
+		throw CatalogException("Failed to drop remote type on server: %s", result->GetError());
+	}
+}
+
 void DuckherderSchemaCatalogEntry::DropEntry(ClientContext &context, DropInfo &info) {
 	DUCKDB_LOG_DEBUG(db_instance, StringUtil::Format("DuckherderSchemaCatalogEntry::DropEntry - type=%s name=%s",
 	                                                 CatalogTypeToString(info.type), info.name));
@@ -308,6 +424,8 @@ void DuckherderSchemaCatalogEntry::DropEntry(ClientContext &context, DropInfo &i
 		DropRemoteTable(context, info);
 	} else if (info.type == CatalogType::VIEW_ENTRY) {
 		DropRemoteView(context, info);
+	} else if (info.type == CatalogType::TYPE_ENTRY) {
+		DropRemoteType(context, info);
 	}
 
 	DuckSchemaEntry::DropEntry(context, info);
@@ -325,8 +443,8 @@ void DuckherderSchemaCatalogEntry::DropEntry(ClientContext &context, DropInfo &i
 void DuckherderSchemaCatalogEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 	DUCKDB_LOG_DEBUG(db_instance, "DuckherderSchemaCatalogEntry::Alter");
 
-	// Check if this is an ALTER TABLE operation on a remote table
-	string renamed_table;
+	string alter_sql;
+	bool alter_view = false;
 	if (info.type == AlterType::ALTER_TABLE) {
 		auto &table_info = info.Cast<AlterTableInfo>();
 
@@ -336,16 +454,33 @@ void DuckherderSchemaCatalogEntry::Alter(CatalogTransaction transaction, AlterIn
 			auto schema_name = KeywordHelper::WriteQuoted(name, '"');
 			auto table_name = KeywordHelper::WriteQuoted(info.name, '"');
 			auto qualified_table_name = StringUtil::Format("%s.%s", schema_name, table_name);
-			string alter_sql = GenerateAlterTableSQL(table_info, qualified_table_name);
+			alter_sql = GenerateAlterTableSQL(table_info, qualified_table_name);
 			DUCKDB_LOG_DEBUG(db_instance, StringUtil::Format("Executing ALTER TABLE on remote server: %s", alter_sql));
-
-			auto &client = duckherder_catalog.GetClient(transaction.GetContext());
-			auto result = client.ExecuteStatement(alter_sql, StatementType::ALTER_STATEMENT);
-			if (result->HasError()) {
-				throw CatalogException("Failed to alter table on server: %s", result->GetError());
-			}
 		}
+	} else if (info.type == AlterType::ALTER_VIEW) {
+		alter_sql = info.ToString();
+		alter_view = true;
+	}
 
+	auto &context = transaction.GetContext();
+	AlterLocal(std::move(transaction), info);
+	if (alter_sql.empty()) {
+		return;
+	}
+
+	auto &client = duckherder_catalog.GetClient(context);
+	auto result = alter_view
+	                  ? client.ExecuteStatement(alter_sql, StatementType::ALTER_STATEMENT, duckherder_catalog.GetName())
+	                  : client.ExecuteStatement(alter_sql, StatementType::ALTER_STATEMENT);
+	if (result->HasError()) {
+		throw CatalogException("Failed to alter %s on server: %s", alter_view ? "view" : "table", result->GetError());
+	}
+}
+
+void DuckherderSchemaCatalogEntry::AlterLocal(CatalogTransaction transaction, AlterInfo &info) {
+	string renamed_table;
+	if (info.type == AlterType::ALTER_TABLE) {
+		auto &table_info = info.Cast<AlterTableInfo>();
 		EntryLookupInfoKey key {
 		    .type = CatalogType::TABLE_ENTRY,
 		    .name = info.name,
@@ -355,13 +490,6 @@ void DuckherderSchemaCatalogEntry::Alter(CatalogTransaction transaction, AlterIn
 		DUCKDB_LOG_DEBUG(db_instance, StringUtil::Format("Cleared cache for table %s after ALTER", info.name));
 		if (table_info.alter_table_type == AlterTableType::RENAME_TABLE) {
 			renamed_table = table_info.Cast<RenameTableInfo>().new_table_name;
-		}
-	} else if (info.type == AlterType::ALTER_VIEW) {
-		auto result =
-		    duckherder_catalog.GetClient(transaction.GetContext())
-		        .ExecuteStatement(info.ToString(), StatementType::ALTER_STATEMENT, duckherder_catalog.GetName());
-		if (result->HasError()) {
-			throw CatalogException("Failed to alter view on server: %s", result->GetError());
 		}
 	}
 

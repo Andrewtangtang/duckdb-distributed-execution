@@ -34,6 +34,7 @@
 #include "duckdb/planner/operator/logical_merge_into.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
+#include "client/execution/logical_remote_alter_table.hpp"
 #include "client/execution/logical_remote_create_index.hpp"
 #include "duckdb/storage/database_size.hpp"
 #include "duckherder_schema_catalog_entry.hpp"
@@ -306,12 +307,19 @@ PhysicalOperator &DuckherderCatalog::PlanMergeInto(ClientContext &context, Physi
 	auto sql = GetRemoteStatementSQL(context);
 	Parser parser;
 	parser.ParseQuery(sql);
-	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::INSERT_STATEMENT) {
+	if (parser.statements.size() != 1) {
 		return DuckCatalog::PlanMergeInto(context, planner, op, plan);
 	}
+	auto statement_type = parser.statements[0]->type;
+	if (statement_type != StatementType::INSERT_STATEMENT &&
+	    statement_type != StatementType::MERGE_INTO_STATEMENT) {
+		return DuckCatalog::PlanMergeInto(context, planner, op, plan);
+	}
+	auto operator_type = statement_type == StatementType::INSERT_STATEMENT ? PhysicalOperatorType::INSERT
+	                                                                      : PhysicalOperatorType::MERGE_INTO;
 
-	DUCKDB_LOG_DEBUG(db_instance, StringUtil::Format("Push UPSERT to control node: %s", sql));
-	return planner.Make<PhysicalRemoteDML>(PhysicalOperatorType::INSERT, op.types, op.table, std::move(sql),
+	DUCKDB_LOG_DEBUG(db_instance, StringUtil::Format("Push MERGE to control node: %s", sql));
+	return planner.Make<PhysicalRemoteDML>(operator_type, op.types, op.table, std::move(sql),
 	                                       op.estimated_cardinality);
 }
 
@@ -324,6 +332,17 @@ unique_ptr<LogicalOperator> DuckherderCatalog::BindCreateIndex(Binder &binder, C
 	DUCKDB_LOG_DEBUG(db_instance, StringUtil::Format("Bind CREATE INDEX on remote table %s", table_name));
 	auto create_index_info = unique_ptr_cast<CreateInfo, CreateIndexInfo>(std::move(stmt.info));
 	return make_uniq<LogicalRemoteCreateIndexOperator>(std::move(create_index_info), table.schema, table);
+}
+
+unique_ptr<LogicalOperator> DuckherderCatalog::BindAlterAddIndex(Binder &binder, TableCatalogEntry &table_entry,
+                                                                 unique_ptr<LogicalOperator> plan,
+                                                                 unique_ptr<CreateIndexInfo> create_info,
+                                                                 unique_ptr<AlterTableInfo> alter_info) {
+	if (table_entry.internal) {
+		return DuckCatalog::BindAlterAddIndex(binder, table_entry, std::move(plan), std::move(create_info),
+		                                     std::move(alter_info));
+	}
+	return make_uniq<LogicalRemoteAlterTableOperator>(std::move(alter_info), table_entry.schema, table_entry);
 }
 
 void DuckherderCatalog::DropSchema(ClientContext &context, DropInfo &info) {

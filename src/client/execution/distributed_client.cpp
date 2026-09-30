@@ -1,11 +1,13 @@
 #include "client/execution/distributed_client.hpp"
 
 #include "arrow_utils.hpp"
+#include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/main/query_result.hpp"
+#include "utils/remote_error.hpp"
 
 #include <arrow/array.h>
 #include <arrow/io/memory.h>
@@ -16,8 +18,22 @@ namespace duckdb {
 
 namespace {
 
+unique_ptr<QueryResult> MakeErrorResult(ErrorData error) {
+	return make_uniq<MaterializedQueryResult>(std::move(error));
+}
+
 unique_ptr<QueryResult> MakeErrorResult(const string &error) {
-	return make_uniq<MaterializedQueryResult>(ErrorData(error));
+	return MakeErrorResult(ErrorData(error));
+}
+
+ErrorData GetResponseError(const arrow::Status &status, const distributed::DistributedResponse &response) {
+	if (!status.ok()) {
+		return ErrorData(ExceptionType::IO, status.ToString());
+	}
+	if (response.success()) {
+		return ErrorData();
+	}
+	return response.has_error() ? FromRemoteError(response.error()) : ErrorData(response.error_message());
 }
 
 unique_ptr<QueryResult> MakeEmptyResult(StatementType statement_type, string name, LogicalType type) {
@@ -35,6 +51,7 @@ unique_ptr<QueryResult> MakeStatementResult(StatementType statement_type) {
 	case StatementType::INSERT_STATEMENT:
 	case StatementType::DELETE_STATEMENT:
 	case StatementType::UPDATE_STATEMENT:
+	case StatementType::MERGE_INTO_STATEMENT:
 		return MakeEmptyResult(statement_type, "Count", LogicalType::BIGINT);
 	case StatementType::ALTER_STATEMENT:
 	case StatementType::DROP_STATEMENT:
@@ -44,13 +61,6 @@ unique_ptr<QueryResult> MakeStatementResult(StatementType statement_type) {
 	default:
 		throw InternalException("Unsupported remote statement result type");
 	}
-}
-
-string GetResponseError(const arrow::Status &status, const distributed::DistributedResponse &response) {
-	if (!status.ok()) {
-		return status.ToString();
-	}
-	return response.success() ? string() : response.error_message();
 }
 
 const char *TransactionActionName(distributed::TransactionAction action) {
@@ -66,15 +76,15 @@ const char *TransactionActionName(distributed::TransactionAction action) {
 	}
 }
 
-string GetTransactionError(const arrow::Status &status, const distributed::DistributedResponse &response,
-                           distributed::TransactionAction action) {
+ErrorData GetTransactionError(const arrow::Status &status, const distributed::DistributedResponse &response,
+                              distributed::TransactionAction action) {
 	auto action_name = TransactionActionName(action);
 	if (!status.ok()) {
-		return StringUtil::Format("Remote Duckherder %s outcome is unknown after retry: %s", action_name,
-		                          status.ToString());
+		return ErrorData(StringUtil::Format("Remote Duckherder %s outcome is unknown after retry: %s", action_name,
+		                                    status.ToString()));
 	}
 	if (response.success()) {
-		return {};
+		return ErrorData();
 	}
 	bool unknown_outcome = false;
 	if (response.has_transaction() && response.transaction().status() == distributed::TRANSACTION_STATUS_UNKNOWN) {
@@ -83,9 +93,11 @@ string GetTransactionError(const arrow::Status &status, const distributed::Distr
 	if (action == distributed::TRANSACTION_ACTION_COMMIT && !response.has_transaction()) {
 		unknown_outcome = true;
 	}
-	return unknown_outcome ? StringUtil::Format("Remote Duckherder %s outcome is unknown: %s", action_name,
-	                                            response.error_message())
-	                       : response.error_message();
+	if (unknown_outcome) {
+		return ErrorData(StringUtil::Format("Remote Duckherder %s outcome is unknown: %s", action_name,
+		                                    response.error_message()));
+	}
+	return response.has_error() ? FromRemoteError(response.error()) : ErrorData(response.error_message());
 }
 
 } // namespace
@@ -168,8 +180,8 @@ unique_ptr<QueryResult> DistributedClient::ExecuteStatement(const string &sql, S
 	distributed::DistributedResponse response;
 	auto status = GetClient(lock).ExecuteStatement(sql, client_catalog, response);
 	auto error = GetResponseError(status, response);
-	if (!error.empty()) {
-		return MakeErrorResult(error);
+	if (error.HasError()) {
+		return MakeErrorResult(std::move(error));
 	}
 	const auto &ipc_result = response.execute_statement().arrow_ipc_result();
 	if (ipc_result.empty()) {
@@ -212,8 +224,8 @@ unique_ptr<QueryResult> DistributedClient::ManageTransaction(distributed::Transa
 	distributed::DistributedResponse response;
 	auto status = GetClient(lock).ManageTransaction(action, response);
 	auto error = GetTransactionError(status, response, action);
-	if (!error.empty()) {
-		return MakeErrorResult(error);
+	if (error.HasError()) {
+		return MakeErrorResult(std::move(error));
 	}
 	return MakeStatementResult(StatementType::TRANSACTION_STATEMENT);
 }
@@ -224,8 +236,8 @@ unique_ptr<QueryResult> DistributedClient::LoadExtension(const string &extension
 	distributed::DistributedResponse response;
 	auto status = GetClient(lock).LoadExtension(extension_name, repository, version, response);
 	auto error = GetResponseError(status, response);
-	if (!error.empty()) {
-		return MakeErrorResult(error);
+	if (error.HasError()) {
+		return MakeErrorResult(std::move(error));
 	}
 	return MakeStatementResult(StatementType::LOAD_STATEMENT);
 }
@@ -235,8 +247,8 @@ unique_ptr<QueryResult> DistributedClient::GetQueryExecutionStats(vector<QueryEx
 	distributed::DistributedResponse response;
 	auto status = GetClient(lock).GetQueryExecutionStats(response);
 	auto error = GetResponseError(status, response);
-	if (!error.empty()) {
-		return MakeErrorResult(error);
+	if (error.HasError()) {
+		return MakeErrorResult(std::move(error));
 	}
 
 	// Extract stats from the response

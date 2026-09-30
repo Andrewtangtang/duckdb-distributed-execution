@@ -7,6 +7,7 @@
 #include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
+#include "duckdb/storage/table_storage_info.hpp"
 #include "entry_lookup_info_hash_utils.hpp"
 #include "utils/mutex.hpp"
 
@@ -16,6 +17,7 @@ namespace duckdb {
 struct CreateSchemaInfo;
 class DatabaseInstance;
 class DuckherderCatalog;
+class PhysicalRemoteAlterTableOperator;
 class PhysicalRemoteCreateTableAs;
 
 class DuckherderSchemaCatalogEntry : public DuckSchemaEntry {
@@ -30,6 +32,11 @@ public:
 	//===--------------------------------------------------------------------===//
 	// SchemaCatalogEntry-specific functions
 	//===--------------------------------------------------------------------===//
+	// Scans catalog entries while exposing remote table wrappers consistently.
+	void Scan(ClientContext &context, CatalogType type,
+	          const std::function<void(CatalogEntry &)> &callback) override;
+	// Scans committed catalog entries while exposing remote table wrappers consistently.
+	void Scan(CatalogType type, const std::function<void(CatalogEntry &)> &callback) override;
 	optional_ptr<CatalogEntry> CreateIndex(CatalogTransaction transaction, CreateIndexInfo &info,
 	                                       TableCatalogEntry &table) override;
 	optional_ptr<CatalogEntry> CreateFunction(CatalogTransaction transaction, CreateFunctionInfo &info) override;
@@ -41,8 +48,12 @@ public:
 	void DropEntry(ClientContext &context, DropInfo &info) override;
 	void Alter(CatalogTransaction transaction, AlterInfo &info) override;
 
+	// Returns metadata for indexes that are physically stored on the control node.
+	vector<IndexInfo> GetRemoteIndexes(const string &table_name);
+
 private:
 	friend class DuckherderCatalog;
+	friend class PhysicalRemoteAlterTableOperator;
 	friend class PhysicalRemoteCreateTableAs;
 
 	DuckherderSchemaCatalogEntry(DuckherderCatalog &duckherder_catalog_p, DatabaseInstance &db_instance_p,
@@ -50,6 +61,10 @@ private:
 
 	optional_ptr<CatalogEntry> CreateTableLocal(CatalogTransaction transaction, BoundCreateTableInfo &info);
 	optional_ptr<CatalogEntry> CreateTypeLocal(CatalogTransaction transaction, CreateTypeInfo &info);
+	// Applies an ALTER only to the client-side metadata cache.
+	void AlterLocal(CatalogTransaction transaction, AlterInfo &info);
+	// Records metadata for an index that is physically stored on the control node.
+	void AddRemoteIndex(TableCatalogEntry &table, const CreateIndexInfo &info);
 
 	CatalogEntry *WrapAndCacheTableCatalogEntryWithLock(EntryLookupInfoKey key, CatalogEntry *catalog_entry)
 	    DUCKDB_REQUIRES(mu);
@@ -58,6 +73,8 @@ private:
 	void DropRemoteTable(ClientContext &context, const DropInfo &info);
 	// Drops the view on the control node before removing its local metadata.
 	void DropRemoteView(ClientContext &context, const DropInfo &info);
+	// Drops the type on the control node before removing its local metadata.
+	void DropRemoteType(ClientContext &context, const DropInfo &info);
 
 	DatabaseInstance &db_instance;
 	DuckherderCatalog &duckherder_catalog;
@@ -69,10 +86,16 @@ private:
 		unique_ptr<CatalogEntry> wrapper;
 	};
 
+	struct RemoteIndexMetadata {
+		string name;
+		IndexInfo info;
+	};
+
 	concurrency::mutex mu;
 	// Cache for catalog entries, including table entries.
 	unordered_map<EntryLookupInfoKey, CachedCatalogEntry, EntryLookupInfoHash, EntryLookupInfoEqual>
 	    catalog_entries DUCKDB_GUARDED_BY(mu);
+	unordered_map<string, vector<RemoteIndexMetadata>> remote_indexes DUCKDB_GUARDED_BY(mu);
 };
 
 } // namespace duckdb

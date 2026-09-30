@@ -5,12 +5,15 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/uuid.hpp"
+#include "duckdb/main/client_data.hpp"
+#include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/statement/delete_statement.hpp"
 #include "duckdb/parser/statement/execute_statement.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
+#include "duckdb/parser/statement/merge_into_statement.hpp"
 #include "duckdb/parser/statement/update_statement.hpp"
 #include "utils/catalog_utils.hpp"
 
@@ -31,6 +34,8 @@ StatementType GetDMLStatementType(PhysicalOperatorType type) {
 		return StatementType::DELETE_STATEMENT;
 	case PhysicalOperatorType::UPDATE:
 		return StatementType::UPDATE_STATEMENT;
+	case PhysicalOperatorType::MERGE_INTO:
+		return StatementType::MERGE_INTO_STATEMENT;
 	default:
 		throw InternalException("Unsupported remote DML operator");
 	}
@@ -54,6 +59,9 @@ string ReturnCompleteRows(const string &sql) {
 		break;
 	case StatementType::DELETE_STATEMENT:
 		returning_list = &statement.Cast<DeleteStatement>().returning_list;
+		break;
+	case StatementType::MERGE_INTO_STATEMENT:
+		returning_list = &statement.Cast<MergeIntoStatement>().returning_list;
 		break;
 	default:
 		return sql;
@@ -88,7 +96,12 @@ string BuildRemotePreparedDMLSQL(ClientContext &context, const string &sql) {
 		arguments.push_back(
 		    StringUtil::Format("%s := %s", KeywordHelper::WriteQuoted(entry.first, '"'), entry.second->ToString()));
 	}
-	auto statement_sql = sql;
+	auto &prepared_statements = ClientData::Get(context).prepared_statements;
+	auto prepared_entry = prepared_statements.find(execute.name);
+	if (prepared_entry == prepared_statements.end() || !prepared_entry->second->unbound_statement) {
+		throw InternalException("Prepared statement %s is unavailable for remote execution", execute.name);
+	}
+	auto statement_sql = prepared_entry->second->unbound_statement->ToString();
 	StringUtil::RTrim(statement_sql);
 	auto prepare_sql = StringUtil::Format("PREPARE %s AS %s", statement_name, statement_sql);
 	if (prepare_sql.back() != ';') {
@@ -121,8 +134,11 @@ SourceResultType PhysicalRemoteDML::GetDataInternal(ExecutionContext &context, D
 		    GetDistributedClient(context.client, table)
 		        .ExecuteStatement(executable_sql, GetDMLStatementType(type), table.catalog.GetName(), &types);
 		if (state.result->HasError()) {
-			throw Exception(ExceptionType::IO,
-			                StringUtil::Format("Failed to execute DML on control node: %s", state.result->GetError()));
+			auto &error = state.result->GetErrorObject();
+			if (error.Type() == ExceptionType::INVALID) {
+				throw IOException("Failed to execute DML on control node: %s", error.RawMessage());
+			}
+			error.Throw();
 		}
 	}
 
