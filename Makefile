@@ -104,5 +104,21 @@ format-all: format
 test-object-storage-s3:
 	bash test/object_storage/run_single_writer_reader_e2e.sh
 
-.PHONY: format-all test-object-storage-s3 test_duckherder_release test_duckherder_debug test_duckherder_reldebug \
-	$(DUCKDB_TEST_TARGETS)
+define RUN_S3_TESTS
+DUCKDB_BIN=./build/$(1)/duckdb bash scripts/local-rustfs.sh test
+./build/$(1)/test/unittest "test/sql/*"
+endef
+
+test_debug_s3: debug
+	@$(call RUN_S3_TESTS,debug)
+
+test_reldebug_s3: reldebug
+	@$(call RUN_S3_TESTS,reldebug)
+
+test_release_s3: release
+	@$(call RUN_S3_TESTS,release)
+
+S3_TEST_TARGETS := test_debug_s3 test_reldebug_s3 test_release_s3
+
+.PHONY: format-all test-object-storage-s3 test_duckherder_release test_duckherder_debug \
+	test_duckherder_reldebug $(DUCKDB_TEST_TARGETS) $(S3_TEST_TARGETS)

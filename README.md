@@ -290,6 +290,83 @@ See the [S3 single-writer/read-only-reader test](test/object_storage/run_single_
 and [local object-storage test](test/sql/object_storage_single_writer_reader.test)
 for executable examples.
 
+For local S3-compatible testing, the RustFS helper starts a persistent Docker-backed service, creates the test bucket,
+and can run an extension write/read smoke test:
+
+```bash
+./scripts/local-rustfs.sh start   # S3 API :19000, console :19001
+./scripts/local-rustfs.sh test    # write, checkpoint, reattach read-only, query
+./scripts/local-rustfs.sh stop    # keeps the Docker volume
+./scripts/local-rustfs.sh reset   # deletes the test data
+```
+
+### Accessing Local RustFS
+
+The helper uses these defaults:
+
+- S3 API endpoint: `http://127.0.0.1:19000`
+- Web console: `http://127.0.0.1:19001`
+- Bucket: `duckherder`
+- Root prefix: `duckherder-test`
+- Access key: `rustfsadmin`
+- Secret key: `rustfsadmin`
+- Region: `us-east-1`
+- URL style: path-style
+
+Open the web console and sign in with the access and secret keys above, or use any S3-compatible client. For example,
+with the AWS CLI:
+
+```bash
+AWS_ACCESS_KEY_ID=rustfsadmin \
+AWS_SECRET_ACCESS_KEY=rustfsadmin \
+AWS_DEFAULT_REGION=us-east-1 \
+aws --endpoint-url http://127.0.0.1:19000 s3 ls s3://duckherder/duckherder-test/
+```
+
+Run `./scripts/local-rustfs.sh status` at any time to print the active endpoint, bucket, root, credentials, and matching
+DuckDB secret SQL. All settings can be overridden with `RUSTFS_*` environment variables. The same overrides must be
+used for subsequent `start`, `status`, `test`, and `stop` commands.
+
+### Configuring the DuckDB S3 Secret
+
+Load an extension that registers DuckDB's `S3` secret type, then create a config-provider secret whose scope covers
+the bucket and root prefix:
+
+```sql
+LOAD cache_httpfs;
+
+CREATE OR REPLACE SECRET local_rustfs (
+    TYPE S3,
+    PROVIDER CONFIG,
+    KEY_ID 'rustfsadmin',
+    SECRET 'rustfsadmin',
+    REGION 'us-east-1',
+    ENDPOINT '127.0.0.1:19000',
+    USE_SSL false,
+    URL_STYLE 'path',
+    SCOPE 's3://duckherder/duckherder-test'
+);
+```
+
+The `ENDPOINT` must not include `http://`; `USE_SSL false` selects HTTP. `URL_STYLE 'path'` is required for this local
+endpoint. The `DATA_PATH` must fall within the secret's `SCOPE`.
+
+To use this storage through Duckherder, start a control node and attach a named database:
+
+```sql
+SELECT duckherder_start_local_server(8815);
+
+ATTACH 'localhost:8815/database.db' AS dh (
+    TYPE duckherder,
+    DATA_PATH 's3://duckherder/duckherder-test/manual',
+    SECRET 'local_rustfs'
+);
+```
+
+Duckherder resolves the secret and sends the required S3 configuration to the control node and workers, which
+create temporary S3 secrets before initializing `duckdb_object_storage`. The current Flight transport does not
+encrypt these credentials; use S3 attachments only on a trusted network until TLS transport is supported.
+
 ## Usage
 
 ### Local Server Management
