@@ -3,7 +3,10 @@
 #include "client.pb.h"
 #include "duckdb.hpp"
 #include "duckdb/common/shared_ptr.hpp"
+#include "duckdb/common/unique_ptr.hpp"
 #include "storage_config.pb.h"
+
+#include <arrow/result.h>
 
 namespace duckdb {
 
@@ -16,20 +19,19 @@ class WorkerManager;
 // read-only clients are kept from writing by their role. Not thread-safe; the server serializes admission.
 class ServedDatabase {
 public:
-	// The Duckling catalog, whose instance is owned by the server.
-	explicit ServedDatabase(shared_ptr<DuckDB> duckling);
-	// An object storage database, opened for its first client.
+	// The object storage database is opened for its first client.
 	explicit ServedDatabase(distributed::StorageConfig config_p);
 
-	// Admit a client with its own connection. Throws if the client would be the database's second writer.
-	shared_ptr<ClientRegistration> AddClient(distributed::ClientRole role, WorkerManager &worker_manager);
+	// Admit a client with its own connection.
+	arrow::Result<shared_ptr<ClientRegistration>> AddClient(distributed::ClientRole role,
+	                                                        WorkerManager &worker_manager);
 	void RemoveClient(distributed::ClientRole role);
 	bool HasClients() const;
+	bool IsDefault() const;
 
 private:
 	const distributed::StorageConfig config;
-	shared_ptr<DuckDB> duckling_instance;
-	shared_ptr<ObjectStorageDatabase> object_storage_database;
+	unique_ptr<ObjectStorageDatabase> database;
 	bool has_writer = false;
 	idx_t reader_count = 0;
 };

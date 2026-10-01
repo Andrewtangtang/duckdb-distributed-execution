@@ -16,7 +16,7 @@ namespace duckdb {
 // Simple worker node that executes queries on partitioned data.
 class WorkerNode : public arrow::flight::FlightServerBase {
 public:
-	explicit WorkerNode(string worker_id_p, string host_p = "0.0.0.0", int port_p = 0, DuckDB *shared_db = nullptr);
+	explicit WorkerNode(string worker_id_p, string host_p = "0.0.0.0", int port_p = 0);
 	~WorkerNode() override = default;
 
 	arrow::Status Start();
@@ -51,17 +51,19 @@ private:
 
 	// Return this worker's read-only instance for the configuration, attaching it on first use.
 	// The instance is a snapshot from that first attach; later writes are not visible through it.
-	ObjectStorageDatabase &GetOrOpenObjectStorageDatabase(const distributed::StorageConfig &config);
+	arrow::Result<ObjectStorageDatabase *> GetOrOpenObjectStorageDatabase(const distributed::StorageConfig &config);
 
 	string worker_id;
 	string host;
 	int port;
-	DuckDB *db;
-	unique_ptr<DuckDB> owned_db;
+	unique_ptr<DuckDB> db;
 	unique_ptr<Connection> conn;
 
 	concurrency::mutex object_storage_mutex;
-	// Keyed by ObjectStorageDatabase::GetKey. Instances stay attached for the worker's lifetime.
+	// Keyed by serialized storage configuration. Instances stay attached for the worker's lifetime.
+	//
+	// TODO(hjiang): Evict an instance when the final client detaches. Worker-lifetime caches retain resources, and
+	// their read-only snapshots do not see later writes.
 	unordered_map<string, unique_ptr<ObjectStorageDatabase>>
 	    object_storage_databases DUCKDB_GUARDED_BY(object_storage_mutex);
 };

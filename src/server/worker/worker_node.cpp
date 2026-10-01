@@ -2,7 +2,6 @@
 #include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
-#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/serializer/binary_deserializer.hpp"
 #include "duckdb/common/serializer/memory_stream.hpp"
@@ -24,26 +23,12 @@
 
 namespace duckdb {
 
-WorkerNode::WorkerNode(string worker_id_p, string host_p, int port_p, DuckDB *shared_db)
+WorkerNode::WorkerNode(string worker_id_p, string host_p, int port_p)
     : worker_id(std::move(worker_id_p)), host(std::move(host_p)), port(port_p) {
-	if (shared_db != nullptr) {
-		db = shared_db;
-	} else {
-		owned_db = make_uniq<DuckDB>(/*path=*/nullptr, /*config=*/nullptr);
-		db = owned_db.get();
-	}
-	// Standalone workers also need core functions when created from a loadable extension.
+	db = make_uniq<DuckDB>(/*path=*/nullptr, /*config=*/nullptr);
+	// Workers need core functions when created from a loadable extension.
 	db->LoadStaticExtension<CoreFunctionsExtension>();
 	conn = make_uniq<Connection>(*db);
-
-	// If using shared DB, set the default catalog to "duckling" to match the server.
-	if (shared_db != nullptr) {
-		auto use_result = conn->Query("USE duckling;");
-		if (use_result->HasError()) {
-			throw InternalException(
-			    StringUtil::Format("Worker %s failed to USE duckling: %s", worker_id, use_result->GetError()));
-		}
-	}
 }
 
 arrow::Status WorkerNode::Start() {
@@ -169,22 +154,16 @@ arrow::Status WorkerNode::HandleExecutePartition(const distributed::ExecuteParti
                                                  distributed::DistributedResponse &resp,
                                                  std::shared_ptr<arrow::RecordBatchReader> &reader) {
 	// Object storage tasks run on their own session of this worker's instance for that database.
-	unique_ptr<Connection> object_storage_conn;
-	if (ObjectStorageDatabase::IsConfigured(req.storage_config())) {
-		ARROW_RETURN_NOT_OK(ValidateRequest(req.storage_config()));
-		try {
-			object_storage_conn = GetOrOpenObjectStorageDatabase(req.storage_config()).Connect();
-		} catch (const std::exception &ex) {
-			return arrow::Status::IOError(StringUtil::Format("Worker %s failed to attach %s: %s", worker_id,
-			                                                 req.storage_config().database_uri(),
-			                                                 ErrorData(ex).Message()));
-		}
+	ARROW_RETURN_NOT_OK(ValidateRequest(req.storage_config()));
+	if (req.storage_config().storage_case() != distributed::StorageConfig::kLocal) {
+		return arrow::Status::Invalid("Workers can execute only on shared local object storage");
 	}
-	auto &task_conn = object_storage_conn ? *object_storage_conn : *conn;
+	ARROW_ASSIGN_OR_RAISE(auto object_storage_database, GetOrOpenObjectStorageDatabase(req.storage_config()));
+	ARROW_ASSIGN_OR_RAISE(auto task_conn, object_storage_database->Connect());
 
 	// Execute the pipeline task with state tracking
 	unique_ptr<QueryResult> result;
-	auto exec_status = ExecutePipelineTask(req, task_conn, result);
+	auto exec_status = ExecutePipelineTask(req, *task_conn, result);
 
 	if (!exec_status.ok()) {
 		resp.set_success(false);
@@ -195,7 +174,7 @@ arrow::Status WorkerNode::HandleExecutePartition(const distributed::ExecuteParti
 	// Convert result to Arrow format.
 	// This represents the LocalState output from this worker node.
 	idx_t row_count = 0;
-	auto status = QueryResultToArrow(*result, task_conn, reader, &row_count);
+	auto status = QueryResultToArrow(*result, *task_conn, reader, &row_count);
 	if (!status.ok()) {
 		return status;
 	}
@@ -290,15 +269,21 @@ arrow::Status WorkerNode::ExecuteSerializedPlan(const distributed::ExecutePartit
 	return arrow::Status::OK();
 }
 
-ObjectStorageDatabase &WorkerNode::GetOrOpenObjectStorageDatabase(const distributed::StorageConfig &config) {
+arrow::Result<ObjectStorageDatabase *>
+WorkerNode::GetOrOpenObjectStorageDatabase(const distributed::StorageConfig &config) {
 	const concurrency::lock_guard<concurrency::mutex> lock(object_storage_mutex);
 	auto &instance = object_storage_databases[ObjectStorageDatabase::GetKey(config)];
 	if (!instance) {
-		instance = make_uniq<ObjectStorageDatabase>(config, AccessMode::READ_ONLY);
+		auto database_result = ObjectStorageDatabase::Create(config, AccessMode::READ_ONLY);
+		if (!database_result.ok()) {
+			return arrow::Status::IOError("Worker ", worker_id, " failed to attach ", config.database_uri(), ": ",
+			                              database_result.status().message());
+		}
+		instance = std::move(database_result).ValueOrDie();
 		DUCKDB_LOG_DEBUG(*instance->GetInstance().instance,
 		                 StringUtil::Format("Worker %s attached %s", worker_id, config.database_uri()));
 	}
-	return *instance;
+	return instance.get();
 }
 
 arrow::Status WorkerNode::QueryResultToArrow(QueryResult &result, Connection &result_conn,

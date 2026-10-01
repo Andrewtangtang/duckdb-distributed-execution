@@ -59,7 +59,7 @@ public:
 
 	// Start a number of local worker nodes in background threads.
 	// Only used for local testing and dev.
-	void StartLocalWorkers(idx_t num_workers);
+	arrow::Status StartLocalWorkers(idx_t num_workers);
 
 	// Stop the server.
 	void Shutdown();
@@ -71,11 +71,11 @@ public:
 	string GetLocation() const;
 
 	// Register an external worker node.
-	void RegisterWorker(const string &worker_id, const string &location);
+	arrow::Status RegisterWorker(const string &worker_id, const string &location);
 
 	// Register or replace the driver node.
 	// Unlike workers, only one driver node can be registered at a time.
-	void RegisterOrReplaceDriver(const string &driver_id, const string &location);
+	arrow::Status RegisterOrReplaceDriver(const string &driver_id, const string &location);
 
 	// Get the number of registered workers.
 	idx_t GetWorkerCount() const;
@@ -180,20 +180,21 @@ private:
 	    DUCKDB_REQUIRES(registration.connection_mutex);
 	void ClearRequestReplay(ClientRegistration &registration) DUCKDB_REQUIRES(registration.connection_mutex);
 
-	// Detach a client from its database, dropping the database once it has no clients.
+	// Detach a client and drop a non-default database after its final client leaves.
 	void RemoveClient(unordered_map<string, shared_ptr<ClientRegistration>>::iterator entry)
 	    DUCKDB_REQUIRES(clients_mutex);
 
 	string host;
 	int port;
-	// Duckling instance, shared with local workers.
+	// Server-owned utility instance used for logging and worker management.
 	shared_ptr<DuckDB> db;
 	unique_ptr<WorkerManager> worker_manager;
 
 	mutable concurrency::shared_mutex clients_mutex;
 	// Keyed by client id.
 	unordered_map<string, shared_ptr<ClientRegistration>> clients DUCKDB_GUARDED_BY(clients_mutex);
-	// Databases with attached clients, keyed by GetStorageKey; the empty key is the Duckling catalog.
+	// Control-node databases keyed by serialized storage configuration. The default in-memory database is retained
+	// after its final client leaves.
 	unordered_map<string, unique_ptr<ServedDatabase>> databases DUCKDB_GUARDED_BY(clients_mutex);
 	DistributedFlightServerTestState test_state;
 
