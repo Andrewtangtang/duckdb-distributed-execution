@@ -1,141 +1,13 @@
 #include "server/driver/result_merger.hpp"
 #include "arrow_utils.hpp"
+#include "duckdb/common/sql_identifier.hpp"
 #include "duckdb/common/string_util.hpp"
-#include "duckdb/storage/data_table.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
+#include "duckdb/storage/data_table.hpp"
 
 namespace duckdb {
 
 ResultMerger::ResultMerger(Connection &conn_p) : conn(conn_p) {
-}
-
-/*static*/ string ResultMerger::BuildAggregateMergeSQL(const string &temp_table, const vector<string> &column_names,
-                                                       const QueryPlanAnalyzer::QueryAnalysis &analysis) {
-	// For aggregates without GROUP BY, we need to merge partial results:
-	// - SUM(partial_sums) for SUM
-	// - SUM(partial_counts) for COUNT
-	// - For AVG: we'd need SUM(partial_sums) / SUM(partial_counts), but this is complex
-	//
-	// For now, we'll use a simple approach: re-aggregate all columns
-
-	string sql = "SELECT ";
-	for (idx_t i = 0; i < column_names.size(); i++) {
-		if (i > 0)
-			sql += ", ";
-
-		// Try to intelligently re-aggregate based on likely function
-		// This is a heuristic - in future, we'd track the actual aggregate functions
-		string col_name_lower = StringUtil::Lower(column_names[i]);
-
-		if (col_name_lower.find("count") != string::npos || col_name_lower.find("cnt") != string::npos) {
-			// COUNT: sum the partial counts
-			sql += StringUtil::Format("SUM(%s) AS %s", column_names[i], column_names[i]);
-		} else if (col_name_lower.find("sum") != string::npos) {
-			// SUM: sum the partial sums
-			sql += StringUtil::Format("SUM(%s) AS %s", column_names[i], column_names[i]);
-		} else if (col_name_lower.find("min") != string::npos) {
-			// MIN: take min of partial mins
-			sql += StringUtil::Format("MIN(%s) AS %s", column_names[i], column_names[i]);
-		} else if (col_name_lower.find("max") != string::npos) {
-			// MAX: take max of partial maxes
-			sql += StringUtil::Format("MAX(%s) AS %s", column_names[i], column_names[i]);
-		} else if (col_name_lower.find("avg") != string::npos) {
-			// AVG: This is tricky - we'd need both sum and count
-			// For now, just take AVG again (not mathematically correct, but works for demo)
-			sql += StringUtil::Format("AVG(%s) AS %s", column_names[i], column_names[i]);
-		} else {
-			// Default: try SUM (works for most aggregates)
-			sql += StringUtil::Format("SUM(%s) AS %s", column_names[i], column_names[i]);
-		}
-	}
-	sql += StringUtil::Format(" FROM %s", temp_table);
-
-	return sql;
-}
-
-/*static*/ string ResultMerger::BuildGroupByMergeSQL(const string &temp_table, const vector<string> &column_names,
-                                                     const QueryPlanAnalyzer::QueryAnalysis &analysis) {
-	// For GROUP BY, we need to:
-	// 1. Identify which columns are group keys (non-aggregate columns)
-	// 2. Identify which columns are aggregates
-	// 3. Re-group by the keys and re-aggregate the aggregate columns
-
-	// Heuristic: columns with aggregate-sounding names are aggregates, others are group keys
-	vector<string> group_keys;
-	vector<string> agg_columns;
-
-	for (const auto &col_name : column_names) {
-		string col_lower = StringUtil::Lower(col_name);
-
-		// Check if this looks like an aggregate column
-		if (col_lower.find("count") != string::npos || col_lower.find("sum") != string::npos ||
-		    col_lower.find("avg") != string::npos || col_lower.find("min") != string::npos ||
-		    col_lower.find("max") != string::npos || col_lower.find("_agg") != string::npos) {
-			agg_columns.emplace_back(col_name);
-		} else {
-			group_keys.emplace_back(col_name);
-		}
-	}
-
-	// If we couldn't identify any group keys, fall back to treating first column as key
-	if (group_keys.empty() && !column_names.empty()) {
-		group_keys.emplace_back(column_names[0]);
-		for (idx_t idx = 1; idx < column_names.size(); ++idx) {
-			agg_columns.emplace_back(column_names[idx]);
-		}
-	}
-
-	// Build SELECT clause
-	string sql = "SELECT ";
-
-	// Add group keys (pass through)
-	for (idx_t idx = 0; idx < group_keys.size(); ++idx) {
-		if (idx > 0) {
-			sql += ", ";
-		}
-		sql += group_keys[idx];
-	}
-
-	// Add re-aggregated columns
-	for (const auto &agg_col : agg_columns) {
-		if (!group_keys.empty() || &agg_col != &agg_columns[0]) {
-			sql += ", ";
-		}
-
-		string col_lower = StringUtil::Lower(agg_col);
-
-		// Apply appropriate re-aggregation based on column name
-		if (col_lower.find("count") != string::npos || col_lower.find("cnt") != string::npos) {
-			sql += StringUtil::Format("SUM(%s) AS %s", agg_col, agg_col);
-		} else if (col_lower.find("sum") != string::npos) {
-			sql += StringUtil::Format("SUM(%s) AS %s", agg_col, agg_col);
-		} else if (col_lower.find("min") != string::npos) {
-			sql += StringUtil::Format("MIN(%s) AS %s", agg_col, agg_col);
-		} else if (col_lower.find("max") != string::npos) {
-			sql += StringUtil::Format("MAX(%s) AS %s", agg_col, agg_col);
-		} else if (col_lower.find("avg") != string::npos) {
-			// AVG is tricky - for now just average the averages (not correct but works for demo)
-			sql += StringUtil::Format("AVG(%s) AS %s", agg_col, agg_col);
-		} else {
-			// Default to SUM
-			sql += StringUtil::Format("SUM(%s) AS %s", agg_col, agg_col);
-		}
-	}
-
-	sql += StringUtil::Format(" FROM %s", temp_table);
-
-	// Add GROUP BY clause
-	if (!group_keys.empty()) {
-		sql += " GROUP BY ";
-		for (idx_t idx = 0; idx < group_keys.size(); ++idx) {
-			if (idx > 0) {
-				sql += ", ";
-			}
-			sql += group_keys[idx];
-		}
-	}
-
-	return sql;
 }
 
 unique_ptr<QueryResult>
@@ -218,10 +90,11 @@ ResultMerger::CollectAndMergeResults(vector<std::unique_ptr<arrow::flight::Fligh
 
 unique_ptr<QueryResult>
 ResultMerger::CollectAndMergeResults(vector<std::unique_ptr<arrow::flight::FlightStreamReader>> &streams,
-                                     const vector<string> &names, const vector<LogicalType> &types,
+                                     const vector<string> &partial_names, const vector<LogicalType> &partial_types,
+                                     const vector<string> &output_names, const vector<LogicalType> &output_types,
                                      const QueryPlanAnalyzer::QueryAnalysis &query_analysis) {
 	// Collect results from all workers
-	auto partial_result = CollectAndMergeResults(streams, names, types);
+	auto partial_result = CollectAndMergeResults(streams, partial_names, partial_types);
 
 	// For simple scans, just return the concatenated results
 	if (query_analysis.merge_strategy == QueryPlanAnalyzer::MergeStrategy::CONCATENATE) {
@@ -229,34 +102,33 @@ ResultMerger::CollectAndMergeResults(vector<std::unique_ptr<arrow::flight::Fligh
 	}
 
 	auto materialized = dynamic_cast<MaterializedQueryResult *>(partial_result.get());
-	if (!materialized || materialized->RowCount() == 0) {
+	if (!materialized) {
 		return partial_result;
 	}
 
 	// Create a temporary table from the collected results
-	string temp_table_name = "__distributed_partial_results__";
+	const auto temp_table_name = QueryPlanAnalyzer::PARTIAL_TABLE_NAME;
 
 	// Drop if exists
 	conn.Query(StringUtil::Format("DROP TABLE IF EXISTS %s", temp_table_name));
 
-	// Create table with correct schema
+	// Create table with internal column names so aliases cannot affect merge semantics.
 	string create_sql = StringUtil::Format("CREATE TEMPORARY TABLE %s (", temp_table_name);
-	for (idx_t idx = 0; idx < names.size(); ++idx) {
+	for (idx_t idx = 0; idx < partial_names.size(); ++idx) {
 		if (idx > 0) {
 			create_sql += ", ";
 		}
-		create_sql += StringUtil::Format("%s %s", names[idx], types[idx].ToString());
+		create_sql +=
+		    StringUtil::Format("%s %s", SQLIdentifier::ToString(partial_names[idx]), partial_types[idx].ToString());
 	}
 	create_sql += ")";
 
 	auto create_result = conn.Query(create_sql);
 	if (create_result->HasError()) {
-		throw std::runtime_error(StringUtil::Format("Failed to create temp table: %s", create_result->GetError()));
+		throw IOException("Failed to create temp table: %s", create_result->GetError());
 	}
 
 	// Insert collected data into temp table - insert row by row
-	idx_t inserted_rows = 0;
-
 	// Get the collection from materialized result
 	auto &collection = materialized->Collection();
 
@@ -264,11 +136,12 @@ ResultMerger::CollectAndMergeResults(vector<std::unique_ptr<arrow::flight::Fligh
 	ColumnDataScanState scan_state;
 	collection.InitializeScan(scan_state);
 	DataChunk insert_chunk;
-	insert_chunk.Initialize(Allocator::DefaultAllocator(), types);
+	insert_chunk.Initialize(Allocator::DefaultAllocator(), partial_types);
 
 	while (collection.Scan(scan_state, insert_chunk)) {
-		if (insert_chunk.size() == 0)
+		if (insert_chunk.size() == 0) {
 			break;
+		}
 
 		// Insert this chunk row by row
 		for (idx_t row_idx = 0; row_idx < insert_chunk.size(); row_idx++) {
@@ -284,9 +157,8 @@ ResultMerger::CollectAndMergeResults(vector<std::unique_ptr<arrow::flight::Fligh
 
 			auto insert_result = conn.Query(row_sql);
 			if (insert_result->HasError()) {
-				throw std::runtime_error(StringUtil::Format("Failed to insert row: %s", insert_result->GetError()));
+				throw IOException("Failed to insert row: %s", insert_result->GetError());
 			}
-			inserted_rows++;
 		}
 	}
 
@@ -295,11 +167,23 @@ ResultMerger::CollectAndMergeResults(vector<std::unique_ptr<arrow::flight::Fligh
 
 	switch (query_analysis.merge_strategy) {
 	case QueryPlanAnalyzer::MergeStrategy::AGGREGATE_MERGE:
-		merge_sql = BuildAggregateMergeSQL(temp_table_name, names, query_analysis);
-		break;
-
 	case QueryPlanAnalyzer::MergeStrategy::GROUP_BY_MERGE:
-		merge_sql = BuildGroupByMergeSQL(temp_table_name, names, query_analysis);
+		merge_sql = "WITH __final(";
+		for (idx_t idx = 0; idx < output_names.size(); ++idx) {
+			if (idx > 0) {
+				merge_sql += ", ";
+			}
+			merge_sql += StringUtil::Format("__o%llu", static_cast<long long unsigned>(idx));
+		}
+		merge_sql += StringUtil::Format(") AS (%s) SELECT ", query_analysis.final_sql);
+		for (idx_t idx = 0; idx < output_names.size(); ++idx) {
+			if (idx > 0) {
+				merge_sql += ", ";
+			}
+			merge_sql += StringUtil::Format("CAST(__o%llu AS %s) AS %s", static_cast<long long unsigned>(idx),
+			                                output_types[idx].ToString(), SQLIdentifier::ToString(output_names[idx]));
+		}
+		merge_sql += " FROM __final";
 		break;
 
 	case QueryPlanAnalyzer::MergeStrategy::DISTINCT_MERGE:

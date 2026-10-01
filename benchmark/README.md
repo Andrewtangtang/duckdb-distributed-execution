@@ -12,7 +12,7 @@ Each `.sql` file contains two tests run sequentially:
    - Expected: DELEGATED mode (single task)
 
 2. **`medium_table.sql`** - 200,000 rows
-   - Expected: NATURAL_PARTITION (range-based)
+   - Expected: ROW_GROUP_PARTITION
 
 3. **`large_table.sql`** - 500,000 rows (~4 row groups)
    - Expected: ROW_GROUP_PARTITION

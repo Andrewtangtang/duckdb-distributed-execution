@@ -9,6 +9,8 @@ namespace duckdb {
 // Analyzes DuckDB logical/physical plans to extract information for distributed execution planning.
 class QueryPlanAnalyzer {
 public:
+	static constexpr const char *PARTIAL_TABLE_NAME = "__distributed_partial_results__";
+
 	explicit QueryPlanAnalyzer(Connection &conn_p);
 
 	// Query DuckDB's estimated parallelization decision.
@@ -52,7 +54,6 @@ public:
 		DISTINCT_MERGE,  // DISTINCT - need to eliminate duplicates
 		GROUP_BY_MERGE   // GROUP BY - need to merge grouped results
 	};
-
 	// Analyze query for aggregations and grouping to determine merge strategy
 	struct QueryAnalysis {
 		MergeStrategy merge_strategy = MergeStrategy::CONCATENATE;
@@ -60,10 +61,11 @@ public:
 		bool has_group_by = false;
 		bool has_distinct = false;
 		bool has_order_by = false;
-		vector<string> aggregate_functions; // e.g., ["COUNT", "SUM", "AVG"]
-		vector<string> group_by_columns;    // Column names in GROUP BY
+		bool supports_partitioned_aggregation = false;
+		string partial_sql;
+		string final_sql;
 	};
-	QueryAnalysis AnalyzeQuery(LogicalOperator &logical_plan);
+	QueryAnalysis AnalyzeQuery(LogicalOperator &logical_plan, const string &sql);
 
 private:
 	Connection &conn;

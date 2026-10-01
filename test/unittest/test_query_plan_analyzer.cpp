@@ -3,6 +3,7 @@
 #include "duckdb.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "server/driver/distributed_executor.hpp"
+#include "server/driver/partition_sql_generator.hpp"
 #include "server/driver/query_plan_analyzer.hpp"
 #include "server/driver/query_utils.hpp"
 #include "server/driver/task_partitioner.hpp"
@@ -176,4 +177,88 @@ TEST_CASE("Local ObjFS scans assign contiguous whole row groups", "[task_partiti
 		REQUIRE(rows == 10000);
 	}
 	std::filesystem::remove_all(root);
+}
+
+TEST_CASE("Partial aggregate SQL preserves global aggregate semantics", "[partial_aggregate]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_FALSE(con.Query("CREATE TABLE aggregates(category VARCHAR, value INTEGER, keep BOOLEAN)")->HasError());
+	REQUIRE_FALSE(con.Query("INSERT INTO aggregates VALUES ('a', 1, true), ('a', NULL, true), ('a', 9, true), "
+	                        "('b', -2, true), ('b', 20, true), ('c', 100, false)")
+	                  ->HasError());
+
+	auto run_partial = [&](const string &sql) {
+		auto plan = con.ExtractPlan(sql);
+		REQUIRE(plan != nullptr);
+		QueryPlanAnalyzer analyzer(con);
+		auto analysis = analyzer.AnalyzeQuery(*plan, sql);
+		REQUIRE(analysis.supports_partitioned_aggregation);
+		REQUIRE_FALSE(con.Query(StringUtil::Format("DROP TABLE IF EXISTS %s", QueryPlanAnalyzer::PARTIAL_TABLE_NAME))
+		                  ->HasError());
+		REQUIRE_FALSE(con.Query(StringUtil::Format("CREATE TEMP TABLE %s AS SELECT * FROM (%s) partials "
+		                                           "WHERE false",
+		                                           QueryPlanAnalyzer::PARTIAL_TABLE_NAME, analysis.partial_sql))
+		                  ->HasError());
+		for (const auto &predicate : {"rowid < 3", "rowid >= 3"}) {
+			auto task_sql = PartitionSQLGenerator::InjectWhereClause(analysis.partial_sql, predicate);
+			REQUIRE_FALSE(
+			    con.Query(StringUtil::Format("INSERT INTO %s %s", QueryPlanAnalyzer::PARTIAL_TABLE_NAME, task_sql))
+			        ->HasError());
+		}
+		return con.Query(analysis.final_sql);
+	};
+	for (const auto &sql :
+	     {"SELECT SUM(value) FROM aggregates", "SELECT category AS key, SUM(value) FROM aggregates GROUP BY 1",
+	      "SELECT SUM(value) FILTER (WHERE value > 0) FROM aggregates",
+	      "SELECT SUM(value) FROM aggregates HAVING AVG(value) >= 5",
+	      "SELECT SUM(value) AS total FROM aggregates ORDER BY total LIMIT 1 OFFSET 0"}) {
+		INFO(sql);
+		auto plan = con.ExtractPlan(sql);
+		REQUIRE(plan != nullptr);
+		QueryPlanAnalyzer analyzer(con);
+		REQUIRE(analyzer.AnalyzeQuery(*plan, sql).supports_partitioned_aggregation);
+	}
+
+	const string grouped_sql =
+	    "SELECT category AS key, SUM(value) FILTER (WHERE value > 0) AS total, COUNT(*) AS n, MIN(value) AS lo, "
+	    "MAX(value) AS hi, AVG(value) AS mean FROM aggregates WHERE keep GROUP BY 1 HAVING AVG(value) >= 5 "
+	    "ORDER BY total DESC LIMIT 1 OFFSET 0";
+	auto expected = con.Query(grouped_sql);
+	auto actual = run_partial(grouped_sql);
+	REQUIRE_FALSE(expected->HasError());
+	REQUIRE_FALSE(actual->HasError());
+	REQUIRE(actual->RowCount() == expected->RowCount());
+	for (idx_t col = 0; col < expected->ColumnCount(); ++col) {
+		REQUIRE(actual->GetValue(col, 0) == expected->GetValue(col, 0));
+	}
+
+	const string empty_sql =
+	    "SELECT SUM(value), COUNT(value), MIN(value), MAX(value), AVG(value) FROM aggregates WHERE false";
+	expected = con.Query(empty_sql);
+	actual = run_partial(empty_sql);
+	REQUIRE_FALSE(actual->HasError());
+	for (idx_t col = 0; col < expected->ColumnCount(); ++col) {
+		auto expected_value = expected->GetValue(col, 0);
+		auto actual_value = actual->GetValue(col, 0);
+		REQUIRE(actual_value.IsNull() == expected_value.IsNull());
+		if (!expected_value.IsNull()) {
+			REQUIRE(actual_value == expected_value);
+		}
+	}
+}
+
+TEST_CASE("Unsupported aggregates retain fallback", "[partial_aggregate]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_FALSE(con.Query("CREATE TABLE aggregates(category INTEGER, value INTEGER)")->HasError());
+	QueryPlanAnalyzer analyzer(con);
+	for (const auto &sql : {"SELECT MEDIAN(value) FROM aggregates", "SELECT SUM(DISTINCT value) FROM aggregates",
+	                        "SELECT SUM(value), MEDIAN(value) FROM aggregates",
+	                        "SELECT category, SUM(value) FROM aggregates GROUP BY GROUPING SETS ((category), ())",
+	                        "SELECT value % 2, SUM(value) FROM aggregates GROUP BY value % 2",
+	                        "SELECT SUM((SELECT value)) FROM aggregates"}) {
+		auto plan = con.ExtractPlan(sql);
+		REQUIRE(plan != nullptr);
+		REQUIRE_FALSE(analyzer.AnalyzeQuery(*plan, sql).supports_partitioned_aggregation);
+	}
 }

@@ -56,9 +56,7 @@ vector<DistributedPipelineTask> TaskPartitioner::ExtractPipelineTasks(LogicalOpe
 		return CreateSingleTask(base_sql);
 	}
 	auto *op = &logical_plan;
-	bool has_aggregate = false;
 	while (op->children.size() == 1) {
-		has_aggregate |= op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY;
 		op = op->children[0].get();
 	}
 	if (op->type != LogicalOperatorType::LOGICAL_GET) {
@@ -73,10 +71,6 @@ vector<DistributedPipelineTask> TaskPartitioner::ExtractPipelineTasks(LogicalOpe
 	table_ref.catalog_name = table->catalog.GetName();
 	table_ref.schema_name = table->schema.name;
 	const string task_sql = statement.ToString();
-	// Complete aggregate queries execute intact on one worker.
-	if (has_aggregate) {
-		return CreateSingleTask(task_sql);
-	}
 
 	// Extract row group information for DuckDB-aligned partitioning
 	// If reliable rowid bounds are unavailable, delegate instead of using modulo-based partitioning.

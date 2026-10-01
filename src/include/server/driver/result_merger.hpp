@@ -21,16 +21,11 @@ public:
 
 	// Collect and merge results with smart merging based on query analysis.
 	unique_ptr<QueryResult> CollectAndMergeResults(vector<std::unique_ptr<arrow::flight::FlightStreamReader>> &streams,
-	                                               const vector<string> &names, const vector<LogicalType> &types,
+	                                               const vector<string> &partial_names,
+	                                               const vector<LogicalType> &partial_types,
+	                                               const vector<string> &output_names,
+	                                               const vector<LogicalType> &output_types,
 	                                               const QueryPlanAnalyzer::QueryAnalysis &query_analysis);
-
-	// Build SQL to re-aggregate partial aggregates (no GROUP BY).
-	static string BuildAggregateMergeSQL(const string &temp_table, const vector<string> &column_names,
-	                                     const QueryPlanAnalyzer::QueryAnalysis &analysis);
-
-	// Build SQL to re-group and re-aggregate (with GROUP BY).
-	static string BuildGroupByMergeSQL(const string &temp_table, const vector<string> &column_names,
-	                                   const QueryPlanAnalyzer::QueryAnalysis &analysis);
 
 private:
 	Connection &conn;

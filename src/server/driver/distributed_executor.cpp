@@ -12,10 +12,10 @@
 #include "duckdb/parallel/pipeline.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/logical_operator.hpp"
-#include "duckdb/planner/operator/logical_filter.hpp"
-#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
+#include "duckdb/planner/operator/logical_filter.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/storage/storage_info.hpp"
 #include "server/driver/query_utils.hpp"
@@ -70,14 +70,26 @@ DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string 
 	if (logical_plan == nullptr) {
 		return exec_result;
 	}
-	if (!IsSupportedPlan(*logical_plan)) {
-		DUCKDB_LOG_DEBUG(db_instance,
-		                 StringUtil::Format("Logical plan for query '%s' contains unsupported operators", sql));
-		return exec_result;
-	}
 
 	// Analyze query to determine merge strategy
-	QueryPlanAnalyzer::QueryAnalysis query_analysis = plan_analyzer->AnalyzeQuery(*logical_plan);
+	QueryPlanAnalyzer::QueryAnalysis query_analysis = plan_analyzer->AnalyzeQuery(*logical_plan, sql);
+	const bool partitioned_aggregation = query_analysis.supports_partitioned_aggregation &&
+	                                     StringUtil::StartsWith(storage_config.database_uri(), "duckdb_objfs://");
+	string execution_sql = partitioned_aggregation ? query_analysis.partial_sql : sql;
+	if (!partitioned_aggregation) {
+		auto sql_upper = StringUtil::Upper(sql);
+		if (sql_upper.find(" ORDER BY ") != string::npos || sql_upper.find(" OFFSET ") != string::npos) {
+			return exec_result;
+		}
+	}
+	if (partitioned_aggregation) {
+		logical_plan = conn.ExtractPlan(execution_sql);
+	}
+	if (!logical_plan || !IsSupportedPlan(*logical_plan)) {
+		DUCKDB_LOG_DEBUG(db_instance, StringUtil::Format("Logical plan for query '%s' contains unsupported operators",
+		                                                 execution_sql));
+		return exec_result;
+	}
 	exec_result.merge_strategy = query_analysis.merge_strategy;
 
 	// Analyze pipeline complexity
@@ -85,13 +97,14 @@ DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string 
 
 	// Phase 2: Extract pipeline tasks and distribute to workers
 	// This replaces the old 1-partition-per-worker approach with flexible task distribution
-	auto tasks = task_partitioner->ExtractPipelineTasks(*logical_plan, sql, workers.size());
+	const idx_t partition_workers = query_analysis.has_aggregation && !partitioned_aggregation ? 1 : workers.size();
+	auto tasks = task_partitioner->ExtractPipelineTasks(*logical_plan, execution_sql, partition_workers);
 	if (tasks.empty()) {
 		return exec_result;
 	}
 
 	// A delegated query already contains its final result, including aggregates.
-	if (tasks.size() == 1) {
+	if (tasks.size() == 1 && !partitioned_aggregation) {
 		query_analysis.merge_strategy = QueryPlanAnalyzer::MergeStrategy::CONCATENATE;
 	}
 	exec_result.merge_strategy = query_analysis.merge_strategy;
@@ -117,7 +130,7 @@ DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string 
 	task_sqls.reserve(tasks.size());
 	serialized_task_plans.reserve(tasks.size());
 
-	for (auto &task : tasks) {
+	for (const auto &task : tasks) {
 		// Extract and serialize the plan for this task
 		auto task_plan = conn.ExtractPlan(task.task_sql);
 		if (task_plan == nullptr) {
@@ -142,9 +155,19 @@ DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string 
 
 	vector<string> names = prepared->GetNames();
 	vector<LogicalType> types = prepared->GetTypes();
+	vector<string> partial_names = names;
+	vector<LogicalType> partial_types = types;
+	if (partitioned_aggregation) {
+		auto partial_prepared = conn.Prepare(query_analysis.partial_sql);
+		if (partial_prepared->HasError()) {
+			return exec_result;
+		}
+		partial_names = partial_prepared->GetNames();
+		partial_types = partial_prepared->GetTypes();
+	}
 	vector<string> serialized_types;
-	serialized_types.reserve(types.size());
-	for (auto &type : types) {
+	serialized_types.reserve(partial_types.size());
+	for (const auto &type : partial_types) {
 		serialized_types.emplace_back(PlanSerializer::SerializeLogicalType(type));
 	}
 
@@ -174,7 +197,7 @@ DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string 
 			req.set_total_partitions(task.total_tasks);
 			req.set_serialized_plan(serialized_task_plans[task_idx]);
 			*req.mutable_storage_config() = storage_config;
-			for (const auto &name : names) {
+			for (const auto &name : partial_names) {
 				req.add_column_names(name);
 			}
 			for (const auto &type_bytes : serialized_types) {
@@ -203,7 +226,8 @@ DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string 
 	}
 
 	// Phase 5: Combine results.
-	auto result = result_merger->CollectAndMergeResults(result_streams, names, types, query_analysis);
+	auto result = result_merger->CollectAndMergeResults(result_streams, partial_names, partial_types, names, types,
+	                                                    query_analysis);
 
 	// Calculate worker execution time (from start to end of worker operations)
 	exec_result.result = std::move(result);
@@ -221,18 +245,6 @@ bool DistributedExecutor::CanDistribute(const string &sql) {
 
 	// Must have a data source to partition
 	if (sql_upper.find(" FROM ") == string::npos) {
-		return false;
-	}
-
-	// ORDER BY requires global ordering - problematic for distributed execution
-	// (would need to collect all data, then sort)
-	if (sql_upper.find(" ORDER BY ") != string::npos) {
-		return false;
-	}
-
-	// LIMIT without ORDER BY could work, but OFFSET is tricky in distributed context
-	// TODO: Could support LIMIT by having deriver stop after N rows collected.
-	if (sql_upper.find(" OFFSET ") != string::npos) {
 		return false;
 	}
 
