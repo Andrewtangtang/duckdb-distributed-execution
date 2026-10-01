@@ -232,6 +232,24 @@ TEST_CASE("Partial aggregate SQL preserves global aggregate semantics", "[partia
 		REQUIRE(actual->GetValue(col, 0) == expected->GetValue(col, 0));
 	}
 
+	// Expression groups, including the form pushed down by remote clients.
+	for (const auto &sql : {"SELECT value % 2 AS parity, SUM(value), COUNT(*) FROM aggregates GROUP BY parity "
+	                        "ORDER BY parity NULLS LAST",
+	                        "SELECT \"%\"(value, CAST(2 AS INTEGER)), sum(\"*\"(value, CAST(3 AS INTEGER))), "
+	                        "max(\"length\"(category)) FROM aggregates GROUP BY 1 ORDER BY 1 NULLS LAST"}) {
+		INFO(sql);
+		expected = con.Query(sql);
+		actual = run_partial(sql);
+		REQUIRE_FALSE(expected->HasError());
+		REQUIRE_FALSE(actual->HasError());
+		REQUIRE(actual->RowCount() == expected->RowCount());
+		for (idx_t row = 0; row < expected->RowCount(); ++row) {
+			for (idx_t col = 0; col < expected->ColumnCount(); ++col) {
+				REQUIRE(Value::NotDistinctFrom(actual->GetValue(col, row), expected->GetValue(col, row)));
+			}
+		}
+	}
+
 	const string empty_sql =
 	    "SELECT SUM(value), COUNT(value), MIN(value), MAX(value), AVG(value) FROM aggregates WHERE false";
 	expected = con.Query(empty_sql);
@@ -255,7 +273,7 @@ TEST_CASE("Unsupported aggregates retain fallback", "[partial_aggregate]") {
 	for (const auto &sql : {"SELECT MEDIAN(value) FROM aggregates", "SELECT SUM(DISTINCT value) FROM aggregates",
 	                        "SELECT SUM(value), MEDIAN(value) FROM aggregates",
 	                        "SELECT category, SUM(value) FROM aggregates GROUP BY GROUPING SETS ((category), ())",
-	                        "SELECT value % 2, SUM(value) FROM aggregates GROUP BY value % 2",
+	                        "SELECT SUM(value) FROM aggregates GROUP BY (SELECT 1)",
 	                        "SELECT SUM((SELECT value)) FROM aggregates"}) {
 		auto plan = con.ExtractPlan(sql);
 		REQUIRE(plan != nullptr);

@@ -248,7 +248,8 @@ bool AnalyzeAggregateOutputs(const string &sql, QueryPlanAnalyzer::QueryAnalysis
 		if (!resolved) {
 			resolved = WithoutAlias(*group);
 		}
-		if (resolved->expression_class != ExpressionClass::COLUMN_REF) {
+		// Workers output each group as `__g<idx>`, so any per-row expression can be merged on the driver.
+		if (resolved->HasSubquery() || resolved->IsWindow()) {
 			return false;
 		}
 		groups.push_back(std::move(resolved));

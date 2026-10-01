@@ -1,6 +1,7 @@
 #include "server/driver/result_merger.hpp"
 #include "arrow_utils.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
+#include "duckdb/main/appender.hpp"
 #include "duckdb/main/client_context.hpp"
 #include <arrow/c/bridge.h>
 #include "duckdb/common/sql_identifier.hpp"
@@ -131,39 +132,17 @@ ResultMerger::CollectAndMergeResults(vector<std::unique_ptr<arrow::flight::Fligh
 		throw IOException("Failed to create temp table: %s", create_result->GetError());
 	}
 
-	// Insert collected data into temp table - insert row by row
-	// Get the collection from materialized result
-	auto &collection = materialized->Collection();
-
-	// Iterate through all chunks in the collection
+	// Append whole chunks; a per-row INSERT statement costs a full parse, bind and execute.
+	Appender appender(conn, TEMP_CATALOG, DEFAULT_SCHEMA, temp_table_name);
 	ColumnDataScanState scan_state;
+	auto &collection = materialized->Collection();
 	collection.InitializeScan(scan_state);
-	DataChunk insert_chunk;
-	insert_chunk.Initialize(Allocator::DefaultAllocator(), partial_types);
-
-	while (collection.Scan(scan_state, insert_chunk)) {
-		if (insert_chunk.size() == 0) {
-			break;
-		}
-
-		// Insert this chunk row by row
-		for (idx_t row_idx = 0; row_idx < insert_chunk.size(); row_idx++) {
-			string row_sql = StringUtil::Format("INSERT INTO %s VALUES (", temp_table_name);
-			for (idx_t col_idx = 0; col_idx < insert_chunk.ColumnCount(); ++col_idx) {
-				if (col_idx > 0) {
-					row_sql += ", ";
-				}
-				auto value = insert_chunk.GetValue(col_idx, row_idx);
-				row_sql += value.ToSQLString();
-			}
-			row_sql += ")";
-
-			auto insert_result = conn.Query(row_sql);
-			if (insert_result->HasError()) {
-				throw IOException("Failed to insert row: %s", insert_result->GetError());
-			}
-		}
+	DataChunk chunk;
+	collection.InitializeScanChunk(chunk);
+	while (collection.Scan(scan_state, chunk)) {
+		appender.AppendDataChunk(chunk);
 	}
+	appender.Close();
 
 	// Apply the appropriate merge strategy
 	string merge_sql;
