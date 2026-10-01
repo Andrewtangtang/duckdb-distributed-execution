@@ -6,9 +6,13 @@
 
 namespace duckdb {
 
+class SelectStatement;
+
 // Analyzes DuckDB logical/physical plans to extract information for distributed execution planning.
 class QueryPlanAnalyzer {
 public:
+	static constexpr const char *PARTIAL_TABLE_NAME = "__distributed_partial_results__";
+
 	explicit QueryPlanAnalyzer(Connection &conn_p);
 
 	// Query DuckDB's estimated parallelization decision.
@@ -60,10 +64,11 @@ public:
 		bool has_group_by = false;
 		bool has_distinct = false;
 		bool has_order_by = false;
-		vector<string> aggregate_functions; // e.g., ["COUNT", "SUM", "AVG"]
-		vector<string> group_by_columns;    // Column names in GROUP BY
+		bool supports_partitioned_aggregation = false;
+		string partial_sql;
+		string final_sql;
 	};
-	QueryAnalysis AnalyzeQuery(LogicalOperator &logical_plan);
+	QueryAnalysis AnalyzeQuery(LogicalOperator &logical_plan, const SelectStatement &statement);
 
 private:
 	Connection &conn;

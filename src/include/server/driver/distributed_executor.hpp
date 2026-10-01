@@ -76,9 +76,6 @@ public:
 	DistributedExecutionResult ExecuteDistributed(const string &sql);
 
 private:
-	// Check if query can be distributed.
-	bool CanDistribute(const string &sql);
-
 	WorkerManager &worker_manager;
 	Connection &conn;
 	distributed::StorageConfig storage_config;
