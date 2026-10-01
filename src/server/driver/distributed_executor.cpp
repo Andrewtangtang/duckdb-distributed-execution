@@ -12,6 +12,7 @@
 #include "duckdb/parallel/pipeline.hpp"
 #include "duckdb/parallel/task_executor.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
@@ -92,9 +93,18 @@ DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string 
 	// Start timing worker execution
 	auto worker_start = std::chrono::high_resolution_clock::now();
 
-	if (!CanDistribute(sql)) {
+	// Which operators can be distributed is checked on the plan.
+	Parser parser;
+	try {
+		parser.ParseQuery(sql);
+	} catch (const ParserException &) {
+		// Local execution reports the syntax error to the client.
 		return exec_result;
 	}
+	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
+		return exec_result;
+	}
+	const auto &statement = parser.statements[0]->Cast<SelectStatement>();
 
 	auto workers = worker_manager.GetAvailableWorkers();
 	if (workers.empty()) {
@@ -114,12 +124,11 @@ DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string 
 	}
 
 	// Analyze query to determine merge strategy
-	QueryPlanAnalyzer::QueryAnalysis query_analysis = plan_analyzer->AnalyzeQuery(*logical_plan, sql);
+	QueryPlanAnalyzer::QueryAnalysis query_analysis = plan_analyzer->AnalyzeQuery(*logical_plan, statement);
 	const bool partitioned_aggregation = query_analysis.supports_partitioned_aggregation &&
 	                                     storage_config.storage_case() != distributed::StorageConfig::STORAGE_NOT_SET;
 	// The partial query scans the same table with the same filters, so it is partitioned with the original plan.
 	const string &execution_sql = partitioned_aggregation ? query_analysis.partial_sql : sql;
-	exec_result.merge_strategy = query_analysis.merge_strategy;
 
 	// Analyze pipeline complexity
 	QueryPlanAnalyzer::PipelineInfo pipeline_info = plan_analyzer->AnalyzePipelines(*logical_plan);
@@ -167,7 +176,8 @@ DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string 
 	if (partitioned_aggregation) {
 		auto partial_prepared = conn.Prepare(query_analysis.partial_sql);
 		if (partial_prepared->HasError()) {
-			return exec_result;
+			throw InternalException("Failed to prepare partial aggregate query '%s': %s", query_analysis.partial_sql,
+			                        partial_prepared->GetError());
 		}
 		partial_names = partial_prepared->GetNames();
 		partial_types = partial_prepared->GetTypes();
@@ -247,17 +257,6 @@ DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string 
 	exec_result.arrow_schema = std::move(schema);
 	exec_result.arrow_batches = std::move(batches);
 	return exec_result;
-}
-
-bool DistributedExecutor::CanDistribute(const string &sql) {
-	Parser parser;
-	try {
-		parser.ParseQuery(sql);
-	} catch (const ParserException &) {
-		// Local execution reports the syntax error to the client.
-		return false;
-	}
-	return parser.statements.size() == 1 && parser.statements[0]->type == StatementType::SELECT_STATEMENT;
 }
 
 } // namespace duckdb

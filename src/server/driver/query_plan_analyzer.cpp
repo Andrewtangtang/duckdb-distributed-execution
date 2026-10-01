@@ -3,14 +3,10 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
-#include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
-#include "duckdb/parser/parser.hpp"
-#include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
-#include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
@@ -23,351 +19,74 @@ namespace duckdb {
 
 namespace {
 
-enum class PartialAggregateType { UNSUPPORTED, COUNT, SUM, MIN, MAX, AVG };
-
-struct PartialAggregate {
-	PartialAggregateType type;
-	unique_ptr<ParsedExpression> expression;
-};
-
-PartialAggregateType GetAggregateType(const string &function_name) {
-	const auto name = StringUtil::Lower(function_name);
-	if (name == "count" || name == "count_star") {
-		return PartialAggregateType::COUNT;
-	}
-	if (name == "sum" || name == "sum_no_overflow") {
-		return PartialAggregateType::SUM;
-	}
-	if (name == "min") {
-		return PartialAggregateType::MIN;
-	}
-	if (name == "max") {
-		return PartialAggregateType::MAX;
-	}
-	if (name == "avg") {
-		return PartialAggregateType::AVG;
-	}
-	return PartialAggregateType::UNSUPPORTED;
-}
-
-unique_ptr<ParsedExpression> ParseExpression(const string &sql) {
-	auto expressions = Parser::ParseExpressionList(sql);
-	D_ASSERT(expressions.size() == 1);
-	return std::move(expressions[0]);
-}
-
-unique_ptr<ParsedExpression> WithoutAlias(const ParsedExpression &expression) {
-	auto result = expression.Copy();
-	result->ClearAlias();
-	return result;
-}
-
-bool SameExpression(const ParsedExpression &left, const ParsedExpression &right) {
-	auto left_copy = WithoutAlias(left);
-	auto right_copy = WithoutAlias(right);
-	return left_copy->Equals(*right_copy);
-}
-
-optional_idx FindGroup(const ParsedExpression &expression, const vector<unique_ptr<ParsedExpression>> &groups,
-                       const vector<string> &aliases) {
-	for (idx_t idx = 0; idx < groups.size(); ++idx) {
-		if (SameExpression(expression, *groups[idx])) {
-			return optional_idx(idx);
-		}
-	}
-	if (expression.expression_class == ExpressionClass::COLUMN_REF) {
-		const auto &column = expression.Cast<ColumnRefExpression>();
-		if (column.column_names.size() == 1) {
-			for (idx_t idx = 0; idx < aliases.size(); ++idx) {
-				if (!aliases[idx].empty() && StringUtil::CIEquals(column.column_names[0], aliases[idx])) {
-					return optional_idx(idx);
-				}
-			}
-		}
-	}
-	return optional_idx();
-}
-
-idx_t FindOrAddAggregate(const FunctionExpression &function, vector<PartialAggregate> &aggregates) {
-	auto expression = WithoutAlias(function);
-	for (idx_t idx = 0; idx < aggregates.size(); ++idx) {
-		if (expression->Equals(*aggregates[idx].expression)) {
-			return idx;
-		}
-	}
-	auto type = GetAggregateType(function.function_name);
-	D_ASSERT(type != PartialAggregateType::UNSUPPORTED);
-	aggregates.push_back({type, std::move(expression)});
-	return aggregates.size() - 1;
-}
-
-void CollectAggregates(const ParsedExpression &expression, vector<PartialAggregate> &aggregates) {
-	if (expression.expression_class == ExpressionClass::FUNCTION) {
-		const auto &function = expression.Cast<FunctionExpression>();
-		if (GetAggregateType(function.function_name) != PartialAggregateType::UNSUPPORTED) {
-			FindOrAddAggregate(function, aggregates);
-			return;
-		}
-	}
-	ParsedExpressionIterator::EnumerateChildren(
-	    expression, [&](const ParsedExpression &child) { CollectAggregates(child, aggregates); });
-}
-
-bool ValidateParsedAggregates(const ParsedExpression &expression) {
-	if (expression.expression_class == ExpressionClass::FUNCTION) {
-		const auto &function = expression.Cast<FunctionExpression>();
-		if (GetAggregateType(function.function_name) != PartialAggregateType::UNSUPPORTED) {
-			if (function.distinct || function.export_state ||
-			    (function.order_bys && !function.order_bys->orders.empty())) {
-				return false;
-			}
-			for (const auto &child : function.children) {
-				if (child->HasSubquery() || child->IsWindow()) {
-					return false;
-				}
-			}
-			return !function.filter || (!function.filter->HasSubquery() && !function.filter->IsWindow());
-		}
-	}
-	bool valid = true;
-	ParsedExpressionIterator::EnumerateChildren(
-	    expression, [&](const ParsedExpression &child) { valid &= ValidateParsedAggregates(child); });
-	return valid;
-}
-
-void RewriteFinalExpression(unique_ptr<ParsedExpression> &expression,
-                            const vector<unique_ptr<ParsedExpression>> &groups, const vector<string> &group_aliases,
-                            vector<PartialAggregate> &aggregates) {
-	auto alias = expression->GetAlias();
-	auto group_idx = FindGroup(*expression, groups, group_aliases);
-	if (group_idx.IsValid()) {
-		expression = make_uniq<ColumnRefExpression>(StringUtil::Format("__g%llu", group_idx.GetIndex()));
-		expression->SetAlias(std::move(alias));
-		return;
-	}
-	if (expression->expression_class == ExpressionClass::FUNCTION) {
-		auto &function = expression->Cast<FunctionExpression>();
-		if (GetAggregateType(function.function_name) != PartialAggregateType::UNSUPPORTED) {
-			auto aggregate_idx = FindOrAddAggregate(function, aggregates);
-			auto column = StringUtil::Format("__a%llu", static_cast<long long unsigned>(aggregate_idx));
-			string sql;
-			switch (aggregates[aggregate_idx].type) {
-			case PartialAggregateType::UNSUPPORTED:
-				throw InternalException("Cannot rewrite an unsupported partial aggregate");
-			case PartialAggregateType::COUNT:
-			case PartialAggregateType::SUM:
-				sql = StringUtil::Format("sum(%s_v)", column);
-				break;
-			case PartialAggregateType::MIN:
-				sql = StringUtil::Format("min(%s_v)", column);
-				break;
-			case PartialAggregateType::MAX:
-				sql = StringUtil::Format("max(%s_v)", column);
-				break;
-			case PartialAggregateType::AVG:
-				sql = StringUtil::Format("sum(%s_s) / sum(%s_c)", column, column);
-				break;
-			}
-			expression = ParseExpression(sql);
-			expression->SetAlias(std::move(alias));
-			return;
-		}
-	}
-	ParsedExpressionIterator::EnumerateChildren(*expression, [&](unique_ptr<ParsedExpression> &child) {
-		RewriteFinalExpression(child, groups, group_aliases, aggregates);
-	});
-}
-
-bool ValidateBoundAggregates(LogicalOperator &logical_plan) {
-	bool valid = true;
-	std::function<void(LogicalOperator &)> visit = [&](LogicalOperator &op) {
-		if (op.type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-			for (const auto &expression : op.Cast<LogicalAggregate>().expressions) {
-				const auto &aggregate = expression->Cast<BoundAggregateExpression>();
-				const auto type = GetAggregateType(aggregate.function.name);
-				valid &= type != PartialAggregateType::UNSUPPORTED && !aggregate.IsDistinct() &&
-				         (!aggregate.order_bys || aggregate.order_bys->orders.empty());
-				if (type == PartialAggregateType::AVG) {
-					valid &= aggregate.children.size() == 1 && aggregate.children[0]->return_type.IsNumeric();
-				}
-			}
-		}
-		for (auto &child : op.children) {
-			visit(*child);
-		}
-	};
-	visit(logical_plan);
-	return valid;
-}
-
-bool AnalyzeAggregateOutputs(const string &sql, QueryPlanAnalyzer::QueryAnalysis &analysis) {
-	Parser parser;
-	parser.ParseQuery(sql);
-	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
-		return false;
-	}
-	auto &statement = parser.statements[0]->Cast<SelectStatement>();
+// Rewrites a pushed aggregate, `SELECT <groups>, <aggregates> FROM <table> [WHERE ...] [GROUP BY 1, ..., k]` (see
+// `distributed_aggregate_pushdown.cpp`), into partial aggregates per row group and the query merging them.
+// Returns false for any other query.
+bool BuildPartialAggregation(const SelectStatement &original, QueryPlanAnalyzer::QueryAnalysis &analysis) {
+	auto copy = original.Copy();
+	auto &statement = copy->Cast<SelectStatement>();
 	if (statement.node->type != QueryNodeType::SELECT_NODE) {
 		return false;
 	}
 	auto &select = statement.node->Cast<SelectNode>();
-	if (!select.from_table || select.from_table->type != TableReferenceType::BASE_TABLE ||
-	    !select.cte_map.map.empty() || select.sample || select.from_table->sample || select.qualify ||
-	    select.groups.grouping_sets.size() > 1) {
+	const auto &groups = select.groups.group_expressions;
+	if (select.having || !select.modifiers.empty() || select.groups.grouping_sets.size() > 1) {
 		return false;
 	}
-	if (!select.groups.grouping_sets.empty() &&
-	    select.groups.grouping_sets[0].size() != select.groups.group_expressions.size()) {
-		return false;
-	}
-
-	vector<unique_ptr<ParsedExpression>> groups;
-	vector<string> group_aliases;
-	for (const auto &group : select.groups.group_expressions) {
-		unique_ptr<ParsedExpression> resolved;
-		if (group->expression_class == ExpressionClass::CONSTANT) {
-			const auto &value = group->Cast<ConstantExpression>().value;
-			if (!value.type().IsIntegral()) {
-				return false;
-			}
-			auto ordinal = value.GetValue<int64_t>();
-			if (ordinal <= 0 || NumericCast<idx_t>(ordinal) > select.select_list.size()) {
-				return false;
-			}
-			resolved = WithoutAlias(*select.select_list[NumericCast<idx_t>(ordinal) - 1]);
-		} else if (group->expression_class == ExpressionClass::COLUMN_REF &&
-		           group->Cast<ColumnRefExpression>().column_names.size() == 1) {
-			const auto &name = group->Cast<ColumnRefExpression>().column_names[0];
-			for (const auto &output : select.select_list) {
-				if (!output->GetAlias().empty() && StringUtil::CIEquals(output->GetAlias(), name)) {
-					resolved = WithoutAlias(*output);
-					break;
-				}
-			}
-		}
-		if (!resolved) {
-			resolved = WithoutAlias(*group);
-		}
-		// Workers output each group as `__g<idx>`, so any per-row expression can be merged on the driver.
-		if (resolved->HasSubquery() || resolved->IsWindow()) {
-			return false;
-		}
-		groups.push_back(std::move(resolved));
-		group_aliases.emplace_back();
-	}
-	for (const auto &output : select.select_list) {
-		if (output->expression_class == ExpressionClass::FUNCTION &&
-		    GetAggregateType(output->Cast<FunctionExpression>().function_name) != PartialAggregateType::UNSUPPORTED) {
-			continue;
-		}
-		auto group_idx = FindGroup(*output, groups, group_aliases);
-		if (!group_idx.IsValid()) {
-			return false;
-		}
-		group_aliases[group_idx.GetIndex()] = output->GetAlias();
-	}
-
-	vector<PartialAggregate> aggregates;
-	for (const auto &output : select.select_list) {
-		if (!ValidateParsedAggregates(*output)) {
-			return false;
-		}
-		CollectAggregates(*output, aggregates);
-	}
-	if (select.having) {
-		if (!ValidateParsedAggregates(*select.having)) {
-			return false;
-		}
-		CollectAggregates(*select.having, aggregates);
-	}
-	for (const auto &modifier : select.modifiers) {
-		if (modifier->type == ResultModifierType::DISTINCT_MODIFIER ||
-		    modifier->type == ResultModifierType::LIMIT_PERCENT_MODIFIER) {
-			return false;
-		}
-		if (modifier->type == ResultModifierType::ORDER_MODIFIER) {
-			for (const auto &order : modifier->Cast<OrderModifier>().orders) {
-				if (!ValidateParsedAggregates(*order.expression)) {
-					return false;
-				}
-				CollectAggregates(*order.expression, aggregates);
-			}
-		}
-	}
-	if (aggregates.empty()) {
-		return false;
-	}
-
-	auto partial_copy = statement.Copy();
-	auto &partial_statement = partial_copy->Cast<SelectStatement>();
-	auto &partial = partial_statement.node->Cast<SelectNode>();
-	partial.select_list.clear();
-	partial.groups.group_expressions.clear();
-	partial.groups.grouping_sets.clear();
-	GroupingSet grouping_set;
 	for (idx_t idx = 0; idx < groups.size(); ++idx) {
-		auto group = groups[idx]->Copy();
-		group->SetAlias(StringUtil::Format("__g%llu", static_cast<long long unsigned>(idx)));
-		partial.select_list.push_back(std::move(group));
-		partial.groups.group_expressions.push_back(groups[idx]->Copy());
-		grouping_set.insert(idx);
+		if (groups[idx]->GetExpressionClass() != ExpressionClass::CONSTANT ||
+		    groups[idx]->Cast<ConstantExpression>().value != Value::INTEGER(NumericCast<int32_t>(idx + 1))) {
+			return false;
+		}
 	}
-	if (!groups.empty()) {
-		partial.groups.grouping_sets.push_back(std::move(grouping_set));
-	}
-	for (idx_t idx = 0; idx < aggregates.size(); ++idx) {
-		const auto &aggregate = aggregates[idx];
-		auto function = aggregate.expression->Copy();
-		auto prefix = StringUtil::Format("__a%llu", static_cast<long long unsigned>(idx));
-		if (aggregate.type == PartialAggregateType::AVG) {
-			function->Cast<FunctionExpression>().function_name = "sum";
-			function->SetAlias(StringUtil::Format("%s_s", prefix));
-			partial.select_list.push_back(std::move(function));
-			auto count = aggregate.expression->Copy();
-			count->Cast<FunctionExpression>().function_name = "count";
-			count->SetAlias(StringUtil::Format("%s_c", prefix));
-			partial.select_list.push_back(std::move(count));
+
+	vector<unique_ptr<ParsedExpression>> partial_list;
+	vector<string> final_list;
+	vector<string> final_groups;
+	for (idx_t idx = 0; idx < select.select_list.size(); ++idx) {
+		auto expr = std::move(select.select_list[idx]);
+		const auto column = StringUtil::Format("__c%llu", idx);
+		if (idx < groups.size()) {
+			final_list.push_back(column);
+			final_groups.push_back(column);
 		} else {
-			function->SetAlias(StringUtil::Format("%s_v", prefix));
-			partial.select_list.push_back(std::move(function));
-		}
-	}
-	partial.having.reset();
-	partial.modifiers.clear();
-	analysis.partial_sql = partial_statement.ToString();
-
-	auto final_copy = statement.Copy();
-	auto &final_statement = final_copy->Cast<SelectStatement>();
-	auto &final = final_statement.node->Cast<SelectNode>();
-	for (auto &output : final.select_list) {
-		RewriteFinalExpression(output, groups, group_aliases, aggregates);
-	}
-	if (final.having) {
-		RewriteFinalExpression(final.having, groups, group_aliases, aggregates);
-	}
-	for (auto &modifier : final.modifiers) {
-		if (modifier->type == ResultModifierType::ORDER_MODIFIER) {
-			for (auto &order : modifier->Cast<OrderModifier>().orders) {
-				RewriteFinalExpression(order.expression, groups, group_aliases, aggregates);
+			if (expr->GetExpressionClass() != ExpressionClass::FUNCTION) {
+				return false;
+			}
+			auto &function = expr->Cast<FunctionExpression>();
+			const auto name = function.function_name;
+			if (function.distinct || function.filter || (function.order_bys && !function.order_bys->orders.empty())) {
+				return false;
+			}
+			if (name == "avg") {
+				auto count = function.Copy();
+				count->Cast<FunctionExpression>().function_name = "count";
+				count->SetAlias(column + "_c");
+				function.function_name = "sum";
+				expr->SetAlias(column + "_s");
+				partial_list.push_back(std::move(expr));
+				partial_list.push_back(std::move(count));
+				final_list.push_back(StringUtil::Format("sum(%s_s) / sum(%s_c)", column, column));
+				continue;
+			}
+			if (name == "count_star" || name == "count" || name == "sum") {
+				final_list.push_back(StringUtil::Format("sum(%s)", column));
+			} else if (name == "min" || name == "max") {
+				final_list.push_back(StringUtil::Format("%s(%s)", name, column));
+			} else {
+				return false;
 			}
 		}
+		expr->SetAlias(column);
+		partial_list.push_back(std::move(expr));
 	}
-	auto partial_table = make_uniq<BaseTableRef>();
-	partial_table->table_name = QueryPlanAnalyzer::PARTIAL_TABLE_NAME;
-	final.from_table = std::move(partial_table);
-	final.where_clause.reset();
-	final.groups.group_expressions.clear();
-	final.groups.grouping_sets.clear();
-	GroupingSet final_grouping_set;
-	for (idx_t idx = 0; idx < groups.size(); ++idx) {
-		final.groups.group_expressions.push_back(
-		    make_uniq<ColumnRefExpression>(StringUtil::Format("__g%llu", static_cast<long long unsigned>(idx))));
-		final_grouping_set.insert(idx);
+	select.select_list = std::move(partial_list);
+	analysis.partial_sql = statement.ToString();
+	analysis.final_sql = StringUtil::Format("SELECT %s FROM %s", StringUtil::Join(final_list, ", "),
+	                                        QueryPlanAnalyzer::PARTIAL_TABLE_NAME);
+	if (!final_groups.empty()) {
+		analysis.final_sql += " GROUP BY " + StringUtil::Join(final_groups, ", ");
 	}
-	if (!groups.empty()) {
-		final.groups.grouping_sets.push_back(std::move(final_grouping_set));
-	}
-	analysis.final_sql = final_statement.ToString();
 	return true;
 }
 
@@ -509,8 +228,10 @@ QueryPlanAnalyzer::PipelineInfo QueryPlanAnalyzer::AnalyzePipelines(LogicalOpera
 	return info;
 }
 
-QueryPlanAnalyzer::QueryAnalysis QueryPlanAnalyzer::AnalyzeQuery(LogicalOperator &logical_plan, const string &sql) {
+QueryPlanAnalyzer::QueryAnalysis QueryPlanAnalyzer::AnalyzeQuery(LogicalOperator &logical_plan,
+                                                                 const SelectStatement &statement) {
 	QueryAnalysis analysis;
+	bool numeric_avg = true;
 
 	// Recursively walk the logical plan tree to find aggregates, GROUP BY, DISTINCT
 	std::function<void(LogicalOperator &)> analyze_operator = [&](LogicalOperator &op) {
@@ -523,6 +244,14 @@ QueryPlanAnalyzer::QueryAnalysis QueryPlanAnalyzer::AnalyzeQuery(LogicalOperator
 			// Check if this is a GROUP BY aggregation
 			if (!agg_op.groups.empty()) {
 				analysis.has_group_by = true;
+			}
+
+			// Merging `avg` as `sum / count` only reproduces it for numeric inputs.
+			for (const auto &expr : agg_op.expressions) {
+				const auto &aggregate = expr->Cast<BoundAggregateExpression>();
+				if (aggregate.function.name == "avg" && !aggregate.children[0]->return_type.IsNumeric()) {
+					numeric_avg = false;
+				}
 			}
 		}
 
@@ -555,10 +284,8 @@ QueryPlanAnalyzer::QueryAnalysis QueryPlanAnalyzer::AnalyzeQuery(LogicalOperator
 	} else {
 		analysis.merge_strategy = MergeStrategy::CONCATENATE;
 	}
-	if (analysis.has_aggregation) {
-		analysis.supports_partitioned_aggregation =
-		    ValidateBoundAggregates(logical_plan) && AnalyzeAggregateOutputs(sql, analysis);
-	}
+	analysis.supports_partitioned_aggregation =
+	    analysis.has_aggregation && numeric_avg && BuildPartialAggregation(statement, analysis);
 
 	return analysis;
 }

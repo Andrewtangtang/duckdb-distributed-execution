@@ -2,6 +2,7 @@
 
 #include "duckdb.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
 #include "server/driver/distributed_executor.hpp"
 #include "server/driver/partition_sql_generator.hpp"
 #include "server/driver/query_plan_analyzer.hpp"
@@ -13,6 +14,18 @@
 #include <filesystem>
 
 using namespace duckdb; // NOLINT
+
+namespace {
+
+QueryPlanAnalyzer::QueryAnalysis AnalyzeQuery(Connection &con, const string &sql) {
+	auto plan = con.ExtractPlan(sql);
+	REQUIRE(plan != nullptr);
+	auto statements = con.ExtractStatements(sql);
+	QueryPlanAnalyzer analyzer(con);
+	return analyzer.AnalyzeQuery(*plan, statements[0]->Cast<SelectStatement>());
+}
+
+} // namespace
 
 TEST_CASE("ContainsTableScan Tests", "[query_utils]") {
 	DuckDB db(nullptr);
@@ -187,16 +200,21 @@ TEST_CASE("Partial aggregate SQL preserves global aggregate semantics", "[partia
 	                        "('b', -2, true), ('b', 20, true), ('c', 100, false)")
 	                  ->HasError());
 
-	auto run_partial = [&](const string &sql) {
-		auto plan = con.ExtractPlan(sql);
-		REQUIRE(plan != nullptr);
-		QueryPlanAnalyzer analyzer(con);
-		auto analysis = analyzer.AnalyzeQuery(*plan, sql);
+	// Queries in the form pushed down by remote clients.
+	for (const auto &sql : {"SELECT sum(value), count(*), count(value), min(value), max(value), avg(value) "
+	                        "FROM aggregates",
+	                        "SELECT category, count(*), sum(value), min(value), max(value), avg(value) "
+	                        "FROM aggregates WHERE keep GROUP BY 1",
+	                        "SELECT \"%\"(value, CAST(2 AS INTEGER)), sum(\"*\"(value, CAST(3 AS INTEGER))), "
+	                        "max(\"length\"(category)) FROM aggregates GROUP BY 1",
+	                        "SELECT category FROM aggregates GROUP BY 1",
+	                        "SELECT sum(value), count(*), avg(value) FROM aggregates WHERE value > 1000"}) {
+		INFO(sql);
+		auto analysis = AnalyzeQuery(con, sql);
 		REQUIRE(analysis.supports_partitioned_aggregation);
-		REQUIRE_FALSE(con.Query(StringUtil::Format("DROP TABLE IF EXISTS %s", QueryPlanAnalyzer::PARTIAL_TABLE_NAME))
-		                  ->HasError());
-		REQUIRE_FALSE(con.Query(StringUtil::Format("CREATE TEMP TABLE %s AS SELECT * FROM (%s) partials "
-		                                           "WHERE false",
+
+		// Compute partial aggregates on two partitions, then merge them.
+		REQUIRE_FALSE(con.Query(StringUtil::Format("CREATE OR REPLACE TEMP TABLE %s AS SELECT * FROM (%s) WHERE false",
 		                                           QueryPlanAnalyzer::PARTIAL_TABLE_NAME, analysis.partial_sql))
 		                  ->HasError());
 		for (const auto &predicate : {"rowid < 3", "rowid >= 3"}) {
@@ -205,62 +223,16 @@ TEST_CASE("Partial aggregate SQL preserves global aggregate semantics", "[partia
 			    con.Query(StringUtil::Format("INSERT INTO %s %s", QueryPlanAnalyzer::PARTIAL_TABLE_NAME, task_sql))
 			        ->HasError());
 		}
-		return con.Query(analysis.final_sql);
-	};
-	for (const auto &sql :
-	     {"SELECT SUM(value) FROM aggregates", "SELECT category AS key, SUM(value) FROM aggregates GROUP BY 1",
-	      "SELECT SUM(value) FILTER (WHERE value > 0) FROM aggregates",
-	      "SELECT SUM(value) FROM aggregates HAVING AVG(value) >= 5",
-	      "SELECT SUM(value) AS total FROM aggregates ORDER BY total LIMIT 1 OFFSET 0"}) {
-		INFO(sql);
-		auto plan = con.ExtractPlan(sql);
-		REQUIRE(plan != nullptr);
-		QueryPlanAnalyzer analyzer(con);
-		REQUIRE(analyzer.AnalyzeQuery(*plan, sql).supports_partitioned_aggregation);
-	}
-
-	const string grouped_sql =
-	    "SELECT category AS key, SUM(value) FILTER (WHERE value > 0) AS total, COUNT(*) AS n, MIN(value) AS lo, "
-	    "MAX(value) AS hi, AVG(value) AS mean FROM aggregates WHERE keep GROUP BY 1 HAVING AVG(value) >= 5 "
-	    "ORDER BY total DESC LIMIT 1 OFFSET 0";
-	auto expected = con.Query(grouped_sql);
-	auto actual = run_partial(grouped_sql);
-	REQUIRE_FALSE(expected->HasError());
-	REQUIRE_FALSE(actual->HasError());
-	REQUIRE(actual->RowCount() == expected->RowCount());
-	for (idx_t col = 0; col < expected->ColumnCount(); ++col) {
-		REQUIRE(actual->GetValue(col, 0) == expected->GetValue(col, 0));
-	}
-
-	// Expression groups, including the form pushed down by remote clients.
-	for (const auto &sql : {"SELECT value % 2 AS parity, SUM(value), COUNT(*) FROM aggregates GROUP BY parity "
-	                        "ORDER BY parity NULLS LAST",
-	                        "SELECT \"%\"(value, CAST(2 AS INTEGER)), sum(\"*\"(value, CAST(3 AS INTEGER))), "
-	                        "max(\"length\"(category)) FROM aggregates GROUP BY 1 ORDER BY 1 NULLS LAST"}) {
-		INFO(sql);
-		expected = con.Query(sql);
-		actual = run_partial(sql);
+		auto expected = con.Query(StringUtil::Format("SELECT * FROM (%s) ORDER BY ALL", sql));
+		auto actual = con.Query(StringUtil::Format("SELECT * FROM (%s) ORDER BY ALL", analysis.final_sql));
 		REQUIRE_FALSE(expected->HasError());
 		REQUIRE_FALSE(actual->HasError());
 		REQUIRE(actual->RowCount() == expected->RowCount());
 		for (idx_t row = 0; row < expected->RowCount(); ++row) {
 			for (idx_t col = 0; col < expected->ColumnCount(); ++col) {
-				REQUIRE(Value::NotDistinctFrom(actual->GetValue(col, row), expected->GetValue(col, row)));
+				REQUIRE(Value::NotDistinctFrom(actual->GetValue(col, row).DefaultCastAs(expected->types[col]),
+				                               expected->GetValue(col, row)));
 			}
-		}
-	}
-
-	const string empty_sql =
-	    "SELECT SUM(value), COUNT(value), MIN(value), MAX(value), AVG(value) FROM aggregates WHERE false";
-	expected = con.Query(empty_sql);
-	actual = run_partial(empty_sql);
-	REQUIRE_FALSE(actual->HasError());
-	for (idx_t col = 0; col < expected->ColumnCount(); ++col) {
-		auto expected_value = expected->GetValue(col, 0);
-		auto actual_value = actual->GetValue(col, 0);
-		REQUIRE(actual_value.IsNull() == expected_value.IsNull());
-		if (!expected_value.IsNull()) {
-			REQUIRE(actual_value == expected_value);
 		}
 	}
 }
@@ -268,16 +240,15 @@ TEST_CASE("Partial aggregate SQL preserves global aggregate semantics", "[partia
 TEST_CASE("Unsupported aggregates retain fallback", "[partial_aggregate]") {
 	DuckDB db(nullptr);
 	Connection con(db);
-	REQUIRE_FALSE(con.Query("CREATE TABLE aggregates(category INTEGER, value INTEGER)")->HasError());
-	QueryPlanAnalyzer analyzer(con);
-	for (const auto &sql : {"SELECT MEDIAN(value) FROM aggregates", "SELECT SUM(DISTINCT value) FROM aggregates",
-	                        "SELECT SUM(value), MEDIAN(value) FROM aggregates",
-	                        "SELECT category, SUM(value) FROM aggregates GROUP BY GROUPING SETS ((category), ())",
-	                        "SELECT SUM(value) FROM aggregates GROUP BY (SELECT 1)",
-	                        "SELECT SUM((SELECT value)) FROM aggregates"}) {
-		auto plan = con.ExtractPlan(sql);
-		REQUIRE(plan != nullptr);
-		REQUIRE_FALSE(analyzer.AnalyzeQuery(*plan, sql).supports_partitioned_aggregation);
+	REQUIRE_FALSE(con.Query("CREATE TABLE aggregates(category INTEGER, value INTEGER, span INTERVAL)")->HasError());
+	for (const auto &sql :
+	     {"SELECT median(value) FROM aggregates", "SELECT sum(DISTINCT value) FROM aggregates",
+	      "SELECT sum(value) FILTER (WHERE value > 0) FROM aggregates", "SELECT avg(span) FROM aggregates",
+	      "SELECT category, sum(value) FROM aggregates GROUP BY category",
+	      "SELECT category, sum(value) FROM aggregates GROUP BY 1 HAVING sum(value) > 0",
+	      "SELECT category, sum(value) FROM aggregates GROUP BY ROLLUP (1)", "SELECT sum(value) + 1 FROM aggregates"}) {
+		INFO(sql);
+		REQUIRE_FALSE(AnalyzeQuery(con, sql).supports_partitioned_aggregation);
 	}
 }
 
@@ -294,8 +265,9 @@ TEST_CASE("Supported plans are decided by plan operators, not SQL keywords", "[q
 		REQUIRE(plan != nullptr);
 		REQUIRE(IsSupportedPlan(*plan));
 	}
-	for (const auto &sql : {"SELECT id FROM t ORDER BY id", "SELECT id FROM t\nORDER\nBY id", "SELECT id FROM t LIMIT 1",
-	                        "SELECT id FROM t LIMIT 1 OFFSET 1", "SELECT 1", "SELECT id FROM t JOIN t t2 USING (id)"}) {
+	for (const auto &sql :
+	     {"SELECT id FROM t ORDER BY id", "SELECT id FROM t\nORDER\nBY id", "SELECT id FROM t LIMIT 1",
+	      "SELECT id FROM t LIMIT 1 OFFSET 1", "SELECT 1", "SELECT id FROM t JOIN t t2 USING (id)"}) {
 		INFO(sql);
 		auto plan = con.ExtractPlan(sql);
 		REQUIRE(plan != nullptr);

@@ -76,9 +76,6 @@ public:
 	DistributedExecutionResult ExecuteDistributed(const string &sql);
 
 private:
-	// Whether `sql` is a single SELECT statement. Which operators can be distributed is checked on its plan.
-	bool CanDistribute(const string &sql);
-
 	WorkerManager &worker_manager;
 	Connection &conn;
 	distributed::StorageConfig storage_config;

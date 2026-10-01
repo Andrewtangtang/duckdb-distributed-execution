@@ -6,6 +6,8 @@
 
 namespace duckdb {
 
+class SelectStatement;
+
 // Analyzes DuckDB logical/physical plans to extract information for distributed execution planning.
 class QueryPlanAnalyzer {
 public:
@@ -66,7 +68,7 @@ public:
 		string partial_sql;
 		string final_sql;
 	};
-	QueryAnalysis AnalyzeQuery(LogicalOperator &logical_plan, const string &sql);
+	QueryAnalysis AnalyzeQuery(LogicalOperator &logical_plan, const SelectStatement &statement);
 
 private:
 	Connection &conn;
