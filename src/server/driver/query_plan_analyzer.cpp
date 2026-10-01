@@ -42,13 +42,11 @@ bool BuildPartialAggregation(const SelectStatement &original, QueryPlanAnalyzer:
 
 	vector<unique_ptr<ParsedExpression>> partial_list;
 	vector<string> final_list;
-	vector<string> final_groups;
 	for (idx_t idx = 0; idx < select.select_list.size(); ++idx) {
 		auto expr = std::move(select.select_list[idx]);
 		const auto column = StringUtil::Format("__c%llu", idx);
 		if (idx < groups.size()) {
 			final_list.push_back(column);
-			final_groups.push_back(column);
 		} else {
 			if (expr->GetExpressionClass() != ExpressionClass::FUNCTION) {
 				return false;
@@ -82,11 +80,9 @@ bool BuildPartialAggregation(const SelectStatement &original, QueryPlanAnalyzer:
 	}
 	select.select_list = std::move(partial_list);
 	analysis.partial_sql = statement.ToString();
-	analysis.final_sql = StringUtil::Format("SELECT %s FROM %s", StringUtil::Join(final_list, ", "),
+	// Group columns are exactly the non-aggregate outputs.
+	analysis.final_sql = StringUtil::Format("SELECT %s FROM %s GROUP BY ALL", StringUtil::Join(final_list, ", "),
 	                                        QueryPlanAnalyzer::PARTIAL_TABLE_NAME);
-	if (!final_groups.empty()) {
-		analysis.final_sql += " GROUP BY " + StringUtil::Join(final_groups, ", ");
-	}
 	return true;
 }
 
