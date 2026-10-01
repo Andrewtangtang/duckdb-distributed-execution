@@ -13,6 +13,8 @@
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
+#include "duckdb/planner/filter/list.hpp"
+#include "duckdb/planner/table_filter.hpp"
 #include "utils/catalog_utils.hpp"
 
 namespace duckdb {
@@ -45,9 +47,88 @@ virtual_column_map_t GetDistributedTableScanVirtualColumns(ClientContext &contex
 	return bind_data->Cast<DistributedTableScanBindData>().table.GetVirtualColumns();
 }
 
-// Builds a remote query returning exactly the requested columns, in output order.
-string BuildProjectedScanSQL(const DistributedTableScanBindData &bind_data, const vector<column_t> &column_ids,
-                             vector<LogicalType> &types) {
+// Returns the quoted name and type of a physical or virtual table column.
+string GetScanColumn(const DistributedTableScanBindData &bind_data, const virtual_column_map_t &virtual_columns,
+                     column_t column_id, LogicalType &type) {
+	if (IsVirtualColumn(column_id)) {
+		auto entry = virtual_columns.find(column_id);
+		if (entry == virtual_columns.end()) {
+			throw InternalException("Distributed table scan received unregistered virtual column %llu", column_id);
+		}
+		type = entry->second.type;
+		return KeywordHelper::WriteOptionallyQuoted(entry->second.name);
+	}
+	auto &column = bind_data.table.GetColumn(LogicalIndex(column_id));
+	type = column.Type();
+	return KeywordHelper::WriteOptionallyQuoted(column.Name());
+}
+
+// ENUMs order by declaration but would compare as strings against a remote literal, and aliased or nested types may
+// not render as valid remote SQL. Filters on these columns are evaluated locally instead.
+bool SupportsFilterPushdown(const LogicalType &type) {
+	return type.id() != LogicalTypeId::ENUM && !type.HasAlias() && !type.IsNested();
+}
+
+bool DistributedTableScanSupportsPushdownType(const FunctionData &bind_data_p, idx_t column_id) {
+	auto &bind_data = bind_data_p.Cast<DistributedTableScanBindData>();
+	LogicalType type;
+	GetScanColumn(bind_data, bind_data.table.GetVirtualColumns(), column_id, type);
+	return SupportsFilterPushdown(type);
+}
+
+// Translates a table filter into a SQL predicate on `column`.
+// Returns an empty string for optional filters, which only prune data and are not needed for correctness.
+string TableFilterToSQL(const TableFilter &filter, const string &column) {
+	switch (filter.filter_type) {
+	case TableFilterType::CONSTANT_COMPARISON: {
+		auto &constant_filter = filter.Cast<ConstantFilter>();
+		auto &constant = constant_filter.constant;
+		// A typed literal makes the server compare with the column type, e.g. FLOAT instead of DECIMAL.
+		return StringUtil::Format("%s %s CAST(%s AS %s)", column,
+		                          ExpressionTypeToOperator(constant_filter.comparison_type), constant.ToSQLString(),
+		                          constant.type().ToString());
+	}
+	case TableFilterType::IS_NULL:
+		return StringUtil::Format("%s IS NULL", column);
+	case TableFilterType::IS_NOT_NULL:
+		return StringUtil::Format("%s IS NOT NULL", column);
+	case TableFilterType::CONJUNCTION_AND: {
+		vector<string> predicates;
+		for (auto &child : filter.Cast<ConjunctionAndFilter>().child_filters) {
+			auto predicate = TableFilterToSQL(*child, column);
+			if (!predicate.empty()) {
+				predicates.emplace_back(std::move(predicate));
+			}
+		}
+		if (predicates.empty()) {
+			return "";
+		}
+		return StringUtil::Format("(%s)", StringUtil::Join(predicates, " AND "));
+	}
+	case TableFilterType::CONJUNCTION_OR: {
+		vector<string> predicates;
+		for (auto &child : filter.Cast<ConjunctionOrFilter>().child_filters) {
+			auto predicate = TableFilterToSQL(*child, column);
+			// An optional branch accepts every row, and so does the whole disjunction.
+			if (predicate.empty()) {
+				return "";
+			}
+			predicates.emplace_back(std::move(predicate));
+		}
+		return StringUtil::Format("(%s)", StringUtil::Join(predicates, " OR "));
+	}
+	case TableFilterType::OPTIONAL_FILTER:
+		return "";
+	default:
+		throw InternalException("Distributed table scan cannot push down table filter %s", filter.ToString(column));
+	}
+}
+
+// Builds a remote query returning exactly the requested columns in output order, with pushed-down filters applied.
+// Filter keys index into `filter_column_ids`, which may include columns that are not returned.
+string BuildScanSQL(const DistributedTableScanBindData &bind_data, const vector<column_t> &column_ids,
+                    const vector<column_t> &filter_column_ids, optional_ptr<TableFilterSet> filters,
+                    vector<LogicalType> &types) {
 	const auto virtual_columns = bind_data.table.GetVirtualColumns();
 	vector<string> select_list;
 	for (auto column_id : column_ids) {
@@ -55,20 +136,35 @@ string BuildProjectedScanSQL(const DistributedTableScanBindData &bind_data, cons
 			// No column is referenced (e.g. count(*)), so only the row count matters.
 			select_list.emplace_back("NULL::BOOLEAN");
 			types.emplace_back(LogicalType::BOOLEAN);
-		} else if (IsVirtualColumn(column_id)) {
-			auto entry = virtual_columns.find(column_id);
-			if (entry == virtual_columns.end()) {
-				throw InternalException("Distributed table scan received unregistered virtual column %llu", column_id);
-			}
-			select_list.emplace_back(KeywordHelper::WriteOptionallyQuoted(entry->second.name));
-			types.emplace_back(entry->second.type);
-		} else {
-			auto &column = bind_data.table.GetColumn(LogicalIndex(column_id));
-			select_list.emplace_back(KeywordHelper::WriteOptionallyQuoted(column.Name()));
-			types.emplace_back(column.Type());
+			continue;
+		}
+		LogicalType type;
+		select_list.emplace_back(GetScanColumn(bind_data, virtual_columns, column_id, type));
+		types.emplace_back(std::move(type));
+	}
+	auto sql =
+	    StringUtil::Format("SELECT %s FROM %s", StringUtil::Join(select_list, ", "), bind_data.remote_table_name);
+
+	if (filters == nullptr) {
+		return sql;
+	}
+	vector<string> predicates;
+	for (auto &entry : filters->filters) {
+		LogicalType type;
+		auto column = GetScanColumn(bind_data, virtual_columns, filter_column_ids[entry.first], type);
+		// Only join filters reach here for unsupported types; the join re-checks those rows anyway.
+		if (!SupportsFilterPushdown(type)) {
+			continue;
+		}
+		auto predicate = TableFilterToSQL(*entry.second, column);
+		if (!predicate.empty()) {
+			predicates.emplace_back(std::move(predicate));
 		}
 	}
-	return StringUtil::Format("SELECT %s FROM %s", StringUtil::Join(select_list, ", "), bind_data.remote_table_name);
+	if (predicates.empty()) {
+		return sql;
+	}
+	return StringUtil::Format("%s WHERE %s", sql, StringUtil::Join(predicates, " AND "));
 }
 
 } // namespace
@@ -84,6 +180,9 @@ struct DistributedTableScanLocalState : public LocalTableFunctionState {
 	}
 	bool finished;
 	vector<column_t> column_ids;
+	string scan_sql;
+	// Expected types come from the table schema to handle special types like ENUM.
+	vector<LogicalType> expected_types;
 	// The whole remote scan result, fetched once and drained one chunk per Execute call.
 	unique_ptr<QueryResult> result;
 };
@@ -100,7 +199,9 @@ bool DistributedTableScanBindData::Equals(const FunctionData &other_p) const {
 TableFunction DistributedTableScanFunction::GetFunction() {
 	TableFunction function("distributed_scan", {}, Execute, Bind, InitGlobal, InitLocal);
 	function.projection_pushdown = true;
-	function.filter_pushdown = false;
+	function.filter_pushdown = true;
+	function.filter_prune = true;
+	function.supports_pushdown_type = DistributedTableScanSupportsPushdownType;
 	function.get_bind_info = GetBindInfo;
 	function.serialize = SerializeDistributedTableScan;
 	function.deserialize = DeserializeDistributedTableScan;
@@ -125,14 +226,24 @@ unique_ptr<GlobalTableFunctionState> DistributedTableScanFunction::InitGlobal(Cl
 unique_ptr<LocalTableFunctionState> DistributedTableScanFunction::InitLocal(ExecutionContext &context,
                                                                             TableFunctionInitInput &input,
                                                                             GlobalTableFunctionState *global_state) {
+	auto &bind_data = input.bind_data->Cast<DistributedTableScanBindData>();
 	auto local_state = make_uniq<DistributedTableScanLocalState>();
-	local_state->column_ids = input.column_ids;
+	if (!input.projection_ids.empty()) {
+		// With filter pruning, the output follows `projection_ids`, which may reorder or drop filter-only columns.
+		for (auto projection_id : input.projection_ids) {
+			local_state->column_ids.emplace_back(input.column_ids[projection_id]);
+		}
+	} else {
+		local_state->column_ids = input.column_ids;
+	}
 	if (local_state->column_ids.empty()) {
-		auto &bind_data = input.bind_data->Cast<DistributedTableScanBindData>();
 		for (idx_t col_idx = 0; col_idx < bind_data.table.GetColumns().LogicalColumnCount(); ++col_idx) {
 			local_state->column_ids.emplace_back(col_idx);
 		}
 	}
+	// Filters include join filters pushed from the build side, which are only known once the scan starts.
+	local_state->scan_sql = BuildScanSQL(bind_data, local_state->column_ids, input.column_ids, input.filters,
+	                                     local_state->expected_types);
 	return std::move(local_state);
 }
 
@@ -146,12 +257,10 @@ void DistributedTableScanFunction::Execute(ClientContext &context, TableFunction
 	}
 
 	if (!local_state.result) {
-		// Expected types come from the table schema to handle special types like ENUM.
-		vector<LogicalType> expected_types;
-		auto scan_source = BuildProjectedScanSQL(bind_data, local_state.column_ids, expected_types);
 		// Paging with LIMIT/OFFSET re-reads the remaining table per chunk and has no stable row order.
 		auto &client = GetDistributedClient(context, bind_data.table);
-		local_state.result = client.ScanTable(scan_source, NO_QUERY_LIMIT, NO_QUERY_OFFSET, &expected_types);
+		local_state.result =
+		    client.ScanTable(local_state.scan_sql, NO_QUERY_LIMIT, NO_QUERY_OFFSET, &local_state.expected_types);
 		if (local_state.result->HasError()) {
 			throw Exception(ExceptionType::INTERNAL,
 			                StringUtil::Format("Distributed table scan error: %s", local_state.result->GetError()));
@@ -159,7 +268,6 @@ void DistributedTableScanFunction::Execute(ClientContext &context, TableFunction
 	}
 
 	auto data_chunk = local_state.result->Fetch();
-
 	// No more data, and mark as finished.
 	if (data_chunk == nullptr || data_chunk->size() == 0) {
 		output.SetCardinality(0);
