@@ -31,6 +31,7 @@ set(PROTO_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/proto/dml.proto
     ${CMAKE_CURRENT_SOURCE_DIR}/src/proto/error.proto
     ${CMAKE_CURRENT_SOURCE_DIR}/src/proto/query.proto
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/proto/storage_config.proto
     ${CMAKE_CURRENT_SOURCE_DIR}/src/proto/transaction.proto
     ${CMAKE_CURRENT_SOURCE_DIR}/src/proto/worker.proto
     ${CMAKE_CURRENT_SOURCE_DIR}/src/proto/distributed.proto)
@@ -76,7 +77,8 @@ set(CLIENT_SOURCES
     src/client/duckherder_transaction_manager.cpp
     src/client/entry_lookup_info_hash_utils.cpp)
 
-set(SERVER_UTIL_SOURCES src/server/validation.cpp)
+set(SERVER_UTIL_SOURCES src/server/object_storage_database.cpp
+                        src/server/validation.cpp)
 
 set(SERVER_DRIVER_SOURCES
     src/server/driver/client_registration.cpp
@@ -94,6 +96,7 @@ set(SERVER_DRIVER_SOURCES
     src/server/driver/query_plan_analyzer.cpp
     src/server/driver/query_utils.cpp
     src/server/driver/result_merger.cpp
+    src/server/driver/served_database.cpp
     src/server/driver/task_partitioner.cpp
     src/server/driver/worker_manager.cpp)
 

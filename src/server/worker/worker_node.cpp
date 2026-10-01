@@ -2,6 +2,7 @@
 #include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/serializer/binary_deserializer.hpp"
 #include "duckdb/common/serializer/memory_stream.hpp"
@@ -13,6 +14,8 @@
 #include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/parser/statement/logical_plan_statement.hpp"
+#include "server/object_storage_database.hpp"
+#include "server/validation.hpp"
 #include "server/worker/worker_node.hpp"
 
 #include <arrow/array.h>
@@ -125,7 +128,7 @@ arrow::Status WorkerNode::DoGet(const arrow::flight::ServerCallContext &context,
 }
 
 // Execute a pipeline task.
-arrow::Status WorkerNode::ExecutePipelineTask(const distributed::ExecutePartitionRequest &req,
+arrow::Status WorkerNode::ExecutePipelineTask(const distributed::ExecutePartitionRequest &req, Connection &task_conn,
                                               unique_ptr<QueryResult> &result) {
 	arrow::Status exec_status = arrow::Status::OK();
 
@@ -148,7 +151,7 @@ arrow::Status WorkerNode::ExecutePipelineTask(const distributed::ExecutePartitio
 
 	// Execute task using SQL-based execution.
 	if (!result && !req.sql().empty()) {
-		result = conn->Query(req.sql());
+		result = task_conn.Query(req.sql());
 	}
 
 	// Validate result.
@@ -165,9 +168,23 @@ arrow::Status WorkerNode::ExecutePipelineTask(const distributed::ExecutePartitio
 arrow::Status WorkerNode::HandleExecutePartition(const distributed::ExecutePartitionRequest &req,
                                                  distributed::DistributedResponse &resp,
                                                  std::shared_ptr<arrow::RecordBatchReader> &reader) {
+	// Object storage tasks run on their own session of this worker's instance for that database.
+	unique_ptr<Connection> object_storage_conn;
+	if (ObjectStorageDatabase::IsConfigured(req.storage_config())) {
+		ARROW_RETURN_NOT_OK(ValidateRequest(req.storage_config()));
+		try {
+			object_storage_conn = GetOrOpenObjectStorageDatabase(req.storage_config()).Connect();
+		} catch (const std::exception &ex) {
+			return arrow::Status::IOError(StringUtil::Format("Worker %s failed to attach %s: %s", worker_id,
+			                                                 req.storage_config().database_uri(),
+			                                                 ErrorData(ex).Message()));
+		}
+	}
+	auto &task_conn = object_storage_conn ? *object_storage_conn : *conn;
+
 	// Execute the pipeline task with state tracking
 	unique_ptr<QueryResult> result;
-	auto exec_status = ExecutePipelineTask(req, result);
+	auto exec_status = ExecutePipelineTask(req, task_conn, result);
 
 	if (!exec_status.ok()) {
 		resp.set_success(false);
@@ -178,7 +195,7 @@ arrow::Status WorkerNode::HandleExecutePartition(const distributed::ExecuteParti
 	// Convert result to Arrow format.
 	// This represents the LocalState output from this worker node.
 	idx_t row_count = 0;
-	auto status = QueryResultToArrow(*result, reader, &row_count);
+	auto status = QueryResultToArrow(*result, task_conn, reader, &row_count);
 	if (!status.ok()) {
 		return status;
 	}
@@ -273,8 +290,19 @@ arrow::Status WorkerNode::ExecuteSerializedPlan(const distributed::ExecutePartit
 	return arrow::Status::OK();
 }
 
-arrow::Status WorkerNode::QueryResultToArrow(QueryResult &result, std::shared_ptr<arrow::RecordBatchReader> &reader,
-                                             idx_t *row_count) {
+ObjectStorageDatabase &WorkerNode::GetOrOpenObjectStorageDatabase(const distributed::StorageConfig &config) {
+	const concurrency::lock_guard<concurrency::mutex> lock(object_storage_mutex);
+	auto &instance = object_storage_databases[ObjectStorageDatabase::GetKey(config)];
+	if (!instance) {
+		instance = make_uniq<ObjectStorageDatabase>(config, AccessMode::READ_ONLY);
+		DUCKDB_LOG_DEBUG(*instance->GetInstance().instance,
+		                 StringUtil::Format("Worker %s attached %s", worker_id, config.database_uri()));
+	}
+	return *instance;
+}
+
+arrow::Status WorkerNode::QueryResultToArrow(QueryResult &result, Connection &result_conn,
+                                             std::shared_ptr<arrow::RecordBatchReader> &reader, idx_t *row_count) {
 	// Convert DuckDB QueryResult to Arrow RecordBatchReader
 	//
 	// This method serializes the LocalState output from this worker node
@@ -293,7 +321,7 @@ arrow::Status WorkerNode::QueryResultToArrow(QueryResult &result, std::shared_pt
 
 	// Ensure client_context is set (required for Arrow conversion)
 	if (!result.client_properties.client_context) {
-		result.client_properties.client_context = conn->context.get();
+		result.client_properties.client_context = result_conn.context.get();
 	}
 	auto client_properties = result.client_properties;
 	client_properties.arrow_lossless_conversion = true;

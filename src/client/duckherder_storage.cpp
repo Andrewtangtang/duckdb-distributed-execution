@@ -12,6 +12,38 @@ namespace duckdb {
 
 namespace {
 
+// Build the object storage selection from the endpoint's database name and DATA_PATH, removing the option so
+// StorageManager doesn't validate it.
+distributed::StorageConfig ExtractStorageConfig(const string &database_name, AttachOptions &options) {
+	if (options.options.find("secret") != options.options.end()) {
+		throw NotImplementedException("Duckherder ATTACH does not support SECRET yet");
+	}
+	string data_path;
+	auto entry = options.options.find("data_path");
+	if (entry != options.options.end()) {
+		data_path = entry->second.ToString();
+		options.options.erase(entry);
+	}
+
+	distributed::StorageConfig config;
+	if (database_name.empty()) {
+		if (!data_path.empty()) {
+			throw InvalidInputException("Duckherder DATA_PATH requires a database name, for example "
+			                            "ATTACH 'localhost:8815/db_name' (TYPE duckherder, DATA_PATH '/path')");
+		}
+		return config;
+	}
+	if (data_path.empty()) {
+		throw InvalidInputException("Duckherder ATTACH of database '%s' requires DATA_PATH", database_name);
+	}
+	if (data_path.find("://") != string::npos) {
+		throw NotImplementedException("Duckherder DATA_PATH only supports local paths yet, got '%s'", data_path);
+	}
+	config.set_database_uri(StringUtil::Format("duckdb_objfs://%s", database_name));
+	config.mutable_local()->set_root(data_path);
+	return config;
+}
+
 unique_ptr<Catalog> DuckherderAttach(optional_ptr<StorageExtensionInfo> storage_info, ClientContext &context,
                                      AttachedDatabase &db, const string &name, AttachInfo &info,
                                      AttachOptions &options) {
@@ -44,14 +76,15 @@ unique_ptr<Catalog> DuckherderAttach(optional_ptr<StorageExtensionInfo> storage_
 
 	// Remove our custom options so StorageManager doesn't validate them.
 	options.options.erase("client_role");
+	auto storage_config = ExtractStorageConfig(endpoint.database_name, options);
 
 	// DuckCatalog is only the client-side metadata cache. Never persist its entries or table storage to the ATTACH
 	// path. Its backing storage must remain writable even when the remote attachment itself is READ_ONLY.
 	info.path = ":memory:";
 	options.access_mode = AccessMode::READ_WRITE;
 
-	auto catalog =
-	    make_uniq<DuckherderCatalog>(db, std::move(endpoint.host), endpoint.port, role, context.GetConnectionId());
+	auto catalog = make_uniq<DuckherderCatalog>(db, std::move(endpoint.host), endpoint.port, role,
+	                                            context.GetConnectionId(), std::move(storage_config));
 	catalog->GetClient(context);
 	return std::move(catalog);
 }

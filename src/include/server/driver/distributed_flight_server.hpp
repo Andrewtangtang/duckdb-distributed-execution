@@ -9,6 +9,7 @@
 #include "server/driver/distributed_executor.hpp"
 #include "server/driver/distributed_flight_server_test_state.hpp"
 #include "server/driver/query_plan_analyzer.hpp"
+#include "server/driver/served_database.hpp"
 #include "server/driver/worker_manager.hpp"
 #include "utils/mutex.hpp"
 
@@ -178,15 +179,22 @@ private:
 	                         const distributed::DistributedResponse &response)
 	    DUCKDB_REQUIRES(registration.connection_mutex);
 	void ClearRequestReplay(ClientRegistration &registration) DUCKDB_REQUIRES(registration.connection_mutex);
+
+	// Detach a client from its database, dropping the database once it has no clients.
+	void RemoveClient(unordered_map<string, shared_ptr<ClientRegistration>>::iterator entry)
+	    DUCKDB_REQUIRES(clients_mutex);
+
 	string host;
 	int port;
-	unique_ptr<DuckDB> db;
+	// Duckling instance, shared with local workers.
+	shared_ptr<DuckDB> db;
 	unique_ptr<WorkerManager> worker_manager;
 
-	// Client admission: at most one writable attachment, with any number of readers.
 	mutable concurrency::shared_mutex clients_mutex;
+	// Keyed by client id.
 	unordered_map<string, shared_ptr<ClientRegistration>> clients DUCKDB_GUARDED_BY(clients_mutex);
-	string writable_client_id DUCKDB_GUARDED_BY(clients_mutex);
+	// Databases with attached clients, keyed by GetStorageKey; the empty key is the Duckling catalog.
+	unordered_map<string, unique_ptr<ServedDatabase>> databases DUCKDB_GUARDED_BY(clients_mutex);
 	DistributedFlightServerTestState test_state;
 
 	// Query execution tracking.

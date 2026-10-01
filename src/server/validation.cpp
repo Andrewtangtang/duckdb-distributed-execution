@@ -2,9 +2,18 @@
 
 #include "client.pb.h"
 #include "distributed.pb.h"
+#include "duckdb/common/local_file_system.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "storage_config.pb.h"
 #include "transaction.pb.h"
 
 namespace duckdb {
+
+namespace {
+
+constexpr const char *OBJFS_SCHEME = "duckdb_objfs://";
+
+} // namespace
 
 arrow::Status ValidateRequest(const distributed::DistributedRequest &request) {
 	if (request.request_case() == distributed::DistributedRequest::REQUEST_NOT_SET) {
@@ -16,6 +25,27 @@ arrow::Status ValidateRequest(const distributed::DistributedRequest &request) {
 arrow::Status ValidateRequest(const distributed::RegisterClientRequest &request) {
 	if (request.role() != distributed::CLIENT_ROLE_READ_ONLY && request.role() != distributed::CLIENT_ROLE_READ_WRITE) {
 		return arrow::Status::Invalid("Duckherder client role must be specified");
+	}
+	return ValidateRequest(request.storage_config());
+}
+
+arrow::Status ValidateRequest(const distributed::StorageConfig &config) {
+	if (config.database_uri().empty()) {
+		if (config.storage_case() != distributed::StorageConfig::STORAGE_NOT_SET) {
+			return arrow::Status::Invalid("Object storage settings require a database");
+		}
+		return arrow::Status::OK();
+	}
+	if (!StringUtil::StartsWith(config.database_uri(), OBJFS_SCHEME) ||
+	    config.database_uri().size() == string(OBJFS_SCHEME).size()) {
+		return arrow::Status::Invalid("Object storage database must be a named duckdb_objfs:// URI");
+	}
+	if (config.storage_case() != distributed::StorageConfig::kLocal) {
+		// In-memory stores are private to one DuckDB instance, so workers could never see the control node's data.
+		return arrow::Status::Invalid("Duckherder currently supports only local object storage");
+	}
+	if (config.local().root().empty() || !LocalFileSystem().IsPathAbsolute(config.local().root())) {
+		return arrow::Status::Invalid("Local object storage root must be an absolute path");
 	}
 	return arrow::Status::OK();
 }

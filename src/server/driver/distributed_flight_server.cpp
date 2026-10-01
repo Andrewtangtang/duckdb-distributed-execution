@@ -10,10 +10,12 @@
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/prepared_statement.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "query_common.hpp"
 #include "server/driver/duckling_storage.hpp"
+#include "server/object_storage_database.hpp"
 #include "server/validation.hpp"
 #include "transaction_constants.hpp"
 #include "utils/remote_error.hpp"
@@ -123,7 +125,7 @@ void DistributedFlightServer::Shutdown() {
 void DistributedFlightServer::Reset() {
 	const concurrency::unique_lock<concurrency::shared_mutex> lock(clients_mutex);
 	clients.clear();
-	writable_client_id.clear();
+	databases.clear();
 	Initialize();
 }
 
@@ -142,7 +144,7 @@ void DistributedFlightServer::Initialize() {
 	DBConfig config;
 	StorageExtension::Register(config, "duckling", make_shared_ptr<DucklingStorageExtension>());
 
-	db = make_uniq<DuckDB>(nullptr, &config);
+	db = make_shared_ptr<DuckDB>(nullptr, &config);
 	// Loadable extensions use DuckDB's dummy loader, so initialize core functions explicitly.
 	db->LoadStaticExtension<CoreFunctionsExtension>();
 	Connection bootstrap_conn(*db);
@@ -281,15 +283,21 @@ void DistributedFlightServer::TouchClient(const shared_ptr<ClientRegistration> &
 void DistributedFlightServer::PruneExpiredClients() {
 	const auto expiration = GetSteadyNowMilliSecSinceEpoch() - test_state.GetClientLeaseTimeout().count();
 	for (auto entry = clients.begin(); entry != clients.end();) {
-		if (entry->second->last_seen.load() >= expiration) {
-			++entry;
-			continue;
+		auto current = entry++;
+		if (current->second->last_seen.load() < expiration) {
+			RemoveClient(current);
 		}
-		if (writable_client_id == entry->first) {
-			writable_client_id.clear();
-		}
-		entry = clients.erase(entry);
 	}
+}
+
+void DistributedFlightServer::RemoveClient(unordered_map<string, shared_ptr<ClientRegistration>>::iterator entry) {
+	auto database = databases.find(entry->second->database_key);
+	D_ASSERT(database != databases.end());
+	database->second->RemoveClient(entry->second->role);
+	if (!database->second->HasClients()) {
+		databases.erase(database);
+	}
+	clients.erase(entry);
 }
 
 bool DistributedFlightServer::AuthorizeClient(const string &client_id, distributed::ClientRole required_role,
@@ -320,16 +328,23 @@ arrow::Status DistributedFlightServer::HandleRegisterClient(const distributed::R
 	}
 	const concurrency::unique_lock<concurrency::shared_mutex> lock(clients_mutex);
 	PruneExpiredClients();
-	if (req.role() == distributed::CLIENT_ROLE_READ_WRITE && !writable_client_id.empty()) {
-		resp.set_success(false);
-		resp.set_error_message("Control node already has a writable Duckherder client");
-		return arrow::Status::OK();
+	const auto &storage_config = req.storage_config();
+	auto &database = databases[ObjectStorageDatabase::GetKey(storage_config)];
+	if (!database) {
+		database = ObjectStorageDatabase::IsConfigured(storage_config) ? make_uniq<ServedDatabase>(storage_config)
+		                                                               : make_uniq<ServedDatabase>(db);
 	}
 
 	auto client_id = UUID::ToString(UUID::GenerateRandomUUID());
-	clients.emplace(client_id, make_shared_ptr<ClientRegistration>(*db, *worker_manager, req.role()));
-	if (req.role() == distributed::CLIENT_ROLE_READ_WRITE) {
-		writable_client_id = client_id;
+	try {
+		clients.emplace(client_id, database->AddClient(req.role(), *worker_manager));
+	} catch (const std::exception &ex) {
+		if (!database->HasClients()) {
+			databases.erase(ObjectStorageDatabase::GetKey(storage_config));
+		}
+		resp.set_success(false);
+		resp.set_error_message(ErrorData(ex).Message());
+		return arrow::Status::OK();
 	}
 	resp.set_success(true);
 	resp.mutable_register_client()->set_client_id(client_id);
@@ -341,10 +356,7 @@ arrow::Status DistributedFlightServer::HandleUnregisterClient(const string &clie
 	const concurrency::unique_lock<concurrency::shared_mutex> lock(clients_mutex);
 	auto entry = clients.find(client_id);
 	if (entry != clients.end()) {
-		if (writable_client_id == client_id) {
-			writable_client_id.clear();
-		}
-		clients.erase(entry);
+		RemoveClient(entry);
 	}
 	resp.set_success(true);
 	resp.mutable_unregister_client();
@@ -899,6 +911,17 @@ arrow::Status DistributedFlightServer::HandleScanTable(const distributed::ScanTa
 		sql += StringUtil::Format(" OFFSET %llu ", req.offset());
 	}
 
+	// Read-only clients may share a read-write instance with the database's writer.
+	if (registration.role != distributed::CLIENT_ROLE_READ_WRITE) {
+		auto prepared = registration.connection->Prepare(sql);
+		if (prepared->HasError()) {
+			return arrow::Status::Invalid("Query error: " + prepared->GetError());
+		}
+		if (!prepared->GetStatementProperties().IsReadOnly()) {
+			return arrow::Status::Invalid("Duckherder client is read-only");
+		}
+	}
+
 	// Start tracking query execution
 	QueryExecutionInfo query_info;
 	query_info.sql = sql;
@@ -907,7 +930,8 @@ arrow::Status DistributedFlightServer::HandleScanTable(const distributed::ScanTa
 
 	// Try distributed execution first if workers are available.
 	unique_ptr<QueryResult> result;
-	if (worker_manager != nullptr && worker_manager->GetWorkerCount() > 0) {
+	if (registration.distributed_executor != nullptr && worker_manager != nullptr &&
+	    worker_manager->GetWorkerCount() > 0) {
 		auto exec_result = registration.distributed_executor->ExecuteDistributed(sql);
 
 		if (exec_result.result != nullptr) {
