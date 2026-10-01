@@ -4,12 +4,17 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/column_binding_map.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_projection.hpp"
 
 namespace duckdb {
 
@@ -19,19 +24,66 @@ bool IsPushableAggregate(const string &name) {
 	return name == "count_star" || name == "count" || name == "sum" || name == "min" || name == "max" || name == "avg";
 }
 
-// Returns the remote column `expr` refers to, or an empty string if it is not a plain column of the scan.
-//
-// TODO(hjiang): Push down groups and aggregate arguments computed by a projection above the scan, e.g.
-// `max(length(payload))` or `sum(amount * 2)`.
-string RenderColumn(const column_binding_map_t<string> &columns, const Expression &expr) {
-	if (expr.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+// Bindings visible to the aggregate: scan columns, and expressions of an optional projection above the scan.
+struct RemoteScope {
+	column_binding_map_t<string> columns;
+	column_binding_map_t<optional_ptr<const Expression>> projections;
+};
+
+// Renders `expr` as SQL on the remote table, or returns an empty string if it cannot be translated with identical
+// semantics.
+string RenderExpression(const RemoteScope &scope, const Expression &expr) {
+	// Results on TIMESTAMPTZ and TIMETZ may depend on client settings such as TimeZone, which the server lacks.
+	auto &type = expr.return_type;
+	if (!SupportsRemoteFilterPushdown(type) || type.id() == LogicalTypeId::TIMESTAMP_TZ ||
+	    type.id() == LogicalTypeId::TIME_TZ) {
 		return "";
 	}
-	auto entry = columns.find(expr.Cast<BoundColumnRefExpression>().binding);
-	return entry == columns.end() ? "" : entry->second;
+	switch (expr.GetExpressionClass()) {
+	case ExpressionClass::BOUND_COLUMN_REF: {
+		auto &binding = expr.Cast<BoundColumnRefExpression>().binding;
+		auto column = scope.columns.find(binding);
+		if (column != scope.columns.end()) {
+			return column->second;
+		}
+		auto projection = scope.projections.find(binding);
+		return projection == scope.projections.end() ? "" : RenderExpression(scope, *projection->second);
+	}
+	case ExpressionClass::BOUND_CONSTANT: {
+		auto &value = expr.Cast<BoundConstantExpression>().value;
+		return StringUtil::Format("CAST(%s AS %s)", value.ToSQLString(), type.ToString());
+	}
+	case ExpressionClass::BOUND_CAST: {
+		auto &cast = expr.Cast<BoundCastExpression>();
+		auto child = RenderExpression(scope, *cast.child);
+		if (child.empty()) {
+			return "";
+		}
+		return StringUtil::Format("%s(%s AS %s)", cast.try_cast ? "TRY_CAST" : "CAST", child, type.ToString());
+	}
+	case ExpressionClass::BOUND_FUNCTION: {
+		auto &function = expr.Cast<BoundFunctionExpression>();
+		if (function.function.GetStability() != FunctionStability::CONSISTENT) {
+			return "";
+		}
+		vector<string> args;
+		for (auto &child : function.children) {
+			auto arg = RenderExpression(scope, *child);
+			if (arg.empty()) {
+				return "";
+			}
+			args.emplace_back(std::move(arg));
+		}
+		// Quoting also calls operators by name, e.g. "+"(a, b).
+		return StringUtil::Format("%s(%s)", KeywordHelper::WriteQuoted(function.function.name, '"'),
+		                          StringUtil::Join(args, ", "));
+	}
+	default:
+		return "";
+	}
 }
 
-string RenderAggregate(const column_binding_map_t<string> &columns, const Expression &expr) {
+string RenderAggregate(const RemoteScope &scope, const Expression &expr) {
 	if (expr.GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
 		return "";
 	}
@@ -46,8 +98,8 @@ string RenderAggregate(const column_binding_map_t<string> &columns, const Expres
 	if (aggregate.children.size() != 1) {
 		return "";
 	}
-	auto column = RenderColumn(columns, *aggregate.children[0]);
-	return column.empty() ? "" : StringUtil::Format("%s(%s)", name, column);
+	auto arg = RenderExpression(scope, *aggregate.children[0]);
+	return arg.empty() ? "" : StringUtil::Format("%s(%s)", name, arg);
 }
 
 // Returns a remote scan computing `aggregate` on the server, or nullptr if the aggregate cannot be pushed down.
@@ -59,10 +111,19 @@ unique_ptr<LogicalOperator> TryPushdownAggregate(Binder &binder, LogicalAggregat
 	if (!aggregate.grouping_sets.empty() && aggregate.grouping_sets[0].size() != aggregate.groups.size()) {
 		return nullptr;
 	}
-	if (aggregate.children[0]->type != LogicalOperatorType::LOGICAL_GET) {
+	RemoteScope scope;
+	reference<LogicalOperator> child = *aggregate.children[0];
+	if (child.get().type == LogicalOperatorType::LOGICAL_PROJECTION) {
+		auto &projection = child.get().Cast<LogicalProjection>();
+		for (idx_t idx = 0; idx < projection.expressions.size(); ++idx) {
+			scope.projections.emplace(ColumnBinding(projection.table_index, idx), projection.expressions[idx].get());
+		}
+		child = *projection.children[0];
+	}
+	if (child.get().type != LogicalOperatorType::LOGICAL_GET) {
 		return nullptr;
 	}
-	auto &get = aggregate.children[0]->Cast<LogicalGet>();
+	auto &get = child.get().Cast<LogicalGet>();
 	if (get.function.name != "distributed_scan" || get.extra_info.sample_options) {
 		return nullptr;
 	}
@@ -71,7 +132,6 @@ unique_ptr<LogicalOperator> TryPushdownAggregate(Binder &binder, LogicalAggregat
 		return nullptr;
 	}
 
-	column_binding_map_t<string> columns;
 	auto &column_ids = get.GetColumnIds();
 	for (idx_t idx = 0; idx < column_ids.size(); ++idx) {
 		auto column_id = column_ids[idx].GetPrimaryIndex();
@@ -79,7 +139,7 @@ unique_ptr<LogicalOperator> TryPushdownAggregate(Binder &binder, LogicalAggregat
 			continue;
 		}
 		LogicalType type;
-		columns.emplace(ColumnBinding(get.table_index, idx), GetRemoteColumn(bind_data, column_id, type));
+		scope.columns.emplace(ColumnBinding(get.table_index, idx), GetRemoteColumn(bind_data, column_id, type));
 	}
 
 	vector<string> predicates;
@@ -100,8 +160,8 @@ unique_ptr<LogicalOperator> TryPushdownAggregate(Binder &binder, LogicalAggregat
 	vector<LogicalType> types;
 	vector<string> names;
 	for (auto &group : aggregate.groups) {
-		auto sql = RenderColumn(columns, *group);
-		if (sql.empty() || !SupportsRemoteFilterPushdown(group->return_type)) {
+		auto sql = RenderExpression(scope, *group);
+		if (sql.empty()) {
 			return nullptr;
 		}
 		select_list.emplace_back(std::move(sql));
@@ -110,8 +170,8 @@ unique_ptr<LogicalOperator> TryPushdownAggregate(Binder &binder, LogicalAggregat
 		names.emplace_back(group->GetName());
 	}
 	for (auto &expr : aggregate.expressions) {
-		auto sql = RenderAggregate(columns, *expr);
-		if (sql.empty() || !SupportsRemoteFilterPushdown(expr->return_type)) {
+		auto sql = RenderAggregate(scope, *expr);
+		if (sql.empty()) {
 			return nullptr;
 		}
 		select_list.emplace_back(std::move(sql));
