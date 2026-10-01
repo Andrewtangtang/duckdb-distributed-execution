@@ -107,19 +107,18 @@ DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string 
 	if (logical_plan == nullptr) {
 		return exec_result;
 	}
+	if (!IsSupportedPlan(*logical_plan)) {
+		DUCKDB_LOG_DEBUG(db_instance,
+		                 StringUtil::Format("Logical plan for query '%s' contains unsupported operators", sql));
+		return exec_result;
+	}
+
 	// Analyze query to determine merge strategy
 	QueryPlanAnalyzer::QueryAnalysis query_analysis = plan_analyzer->AnalyzeQuery(*logical_plan, sql);
 	const bool partitioned_aggregation = query_analysis.supports_partitioned_aggregation &&
 	                                     StringUtil::StartsWith(storage_config.database_uri(), "duckdb_objfs://");
-	string execution_sql = partitioned_aggregation ? query_analysis.partial_sql : sql;
-	if (partitioned_aggregation) {
-		logical_plan = conn.ExtractPlan(execution_sql);
-	}
-	if (!logical_plan || !IsSupportedPlan(*logical_plan)) {
-		DUCKDB_LOG_DEBUG(db_instance, StringUtil::Format("Logical plan for query '%s' contains unsupported operators",
-		                                                 execution_sql));
-		return exec_result;
-	}
+	// The partial query scans the same table with the same filters, so it is partitioned with the original plan.
+	const string &execution_sql = partitioned_aggregation ? query_analysis.partial_sql : sql;
 	exec_result.merge_strategy = query_analysis.merge_strategy;
 
 	// Analyze pipeline complexity
@@ -153,28 +152,6 @@ DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string 
 		worker_to_tasks[worker_id].emplace_back(idx);
 	}
 
-	// Prepare task SQLs and plans
-	// Note: For now, we prepare all tasks upfront. Future optimization: prepare on-demand
-	vector<string> task_sqls;
-	vector<string> serialized_task_plans;
-	task_sqls.reserve(tasks.size());
-	serialized_task_plans.reserve(tasks.size());
-
-	for (const auto &task : tasks) {
-		// Extract and serialize the plan for this task
-		auto task_plan = conn.ExtractPlan(task.task_sql);
-		if (task_plan == nullptr) {
-			return exec_result;
-		}
-		if (!IsSupportedPlan(*task_plan)) {
-			return exec_result;
-		}
-
-		// Serialize the plan for transmission to worker.
-		serialized_task_plans.emplace_back(PlanSerializer::SerializeLogicalPlan(*task_plan));
-		task_sqls.emplace_back(task.task_sql);
-	}
-
 	// Phase 3: Prepare result schema and type information。
 	auto prepared = conn.Prepare(sql);
 	if (prepared->HasError()) {
@@ -206,10 +183,9 @@ DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string 
 	for (idx_t task_idx = 0; task_idx < tasks.size(); ++task_idx) {
 		auto &task = tasks[task_idx];
 		auto &req = requests[task_idx];
-		req.set_sql(task_sqls[task_idx]);
+		req.set_sql(task.task_sql);
 		req.set_partition_id(task.task_id);
 		req.set_total_partitions(task.total_tasks);
-		req.set_serialized_plan(serialized_task_plans[task_idx]);
 		*req.mutable_storage_config() = storage_config;
 		for (const auto &name : partial_names) {
 			req.add_column_names(name);
@@ -250,8 +226,8 @@ DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string 
 
 	// Phase 5: Combine results.
 	if (partitioned_aggregation) {
-		exec_result.result = result_merger->CollectAndMergeResults(result_streams, partial_names, partial_types, names,
-		                                                           types, query_analysis);
+		exec_result.result = result_merger->MergePartialAggregates(result_streams, partial_names, partial_types, names,
+		                                                           types, query_analysis.final_sql);
 		return exec_result;
 	}
 	std::shared_ptr<arrow::Schema> schema;

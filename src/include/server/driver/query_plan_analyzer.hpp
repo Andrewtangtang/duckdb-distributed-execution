@@ -54,6 +54,7 @@ public:
 		DISTINCT_MERGE,  // DISTINCT - need to eliminate duplicates
 		GROUP_BY_MERGE   // GROUP BY - need to merge grouped results
 	};
+
 	// Analyze query for aggregations and grouping to determine merge strategy
 	struct QueryAnalysis {
 		MergeStrategy merge_strategy = MergeStrategy::CONCATENATE;
