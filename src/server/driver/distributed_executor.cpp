@@ -116,7 +116,7 @@ DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string 
 	// Analyze query to determine merge strategy
 	QueryPlanAnalyzer::QueryAnalysis query_analysis = plan_analyzer->AnalyzeQuery(*logical_plan, sql);
 	const bool partitioned_aggregation = query_analysis.supports_partitioned_aggregation &&
-	                                     StringUtil::StartsWith(storage_config.database_uri(), "duckdb_objfs://");
+	                                     storage_config.storage_case() != distributed::StorageConfig::STORAGE_NOT_SET;
 	// The partial query scans the same table with the same filters, so it is partitioned with the original plan.
 	const string &execution_sql = partitioned_aggregation ? query_analysis.partial_sql : sql;
 	exec_result.merge_strategy = query_analysis.merge_strategy;
