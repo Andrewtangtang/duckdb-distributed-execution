@@ -327,8 +327,13 @@ arrow::Status WorkerNode::QueryResultToArrow(QueryResult &result, Connection &re
 	QueryResultChunkScanState scan_state(result);
 	while (true) {
 		ArrowArray arrow_array;
-		if (ArrowUtil::FetchChunk(scan_state, client_properties, DEFAULT_ROW_GROUP_SIZE, &arrow_array,
-		                          extension_types) == 0) {
+		idx_t fetched = 0;
+		ErrorData error;
+		if (!ArrowUtil::TryFetchChunk(scan_state, client_properties, DEFAULT_ROW_GROUP_SIZE, &arrow_array, fetched,
+		                              error, extension_types)) {
+			return arrow::Status::Invalid("Task execution failed: " + error.Message());
+		}
+		if (fetched == 0) {
 			break;
 		}
 
