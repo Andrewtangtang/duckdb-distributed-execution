@@ -11,6 +11,7 @@
 #include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/parallel/pipeline.hpp"
 #include "duckdb/parallel/task_executor.hpp"
+#include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
@@ -111,12 +112,6 @@ DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string 
 	const bool partitioned_aggregation = query_analysis.supports_partitioned_aggregation &&
 	                                     StringUtil::StartsWith(storage_config.database_uri(), "duckdb_objfs://");
 	string execution_sql = partitioned_aggregation ? query_analysis.partial_sql : sql;
-	if (!partitioned_aggregation) {
-		auto sql_upper = StringUtil::Upper(sql);
-		if (sql_upper.find(" ORDER BY ") != string::npos || sql_upper.find(" OFFSET ") != string::npos) {
-			return exec_result;
-		}
-	}
 	if (partitioned_aggregation) {
 		logical_plan = conn.ExtractPlan(execution_sql);
 	}
@@ -279,20 +274,14 @@ DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string 
 }
 
 bool DistributedExecutor::CanDistribute(const string &sql) {
-	string sql_upper = StringUtil::Upper(sql);
-	StringUtil::Trim(sql_upper);
-
-	// Must be a SELECT query
-	if (!StringUtil::StartsWith(sql_upper, "SELECT ")) {
+	Parser parser;
+	try {
+		parser.ParseQuery(sql);
+	} catch (const ParserException &) {
+		// Local execution reports the syntax error to the client.
 		return false;
 	}
-
-	// Must have a data source to partition
-	if (sql_upper.find(" FROM ") == string::npos) {
-		return false;
-	}
-
-	return true;
+	return parser.statements.size() == 1 && parser.statements[0]->type == StatementType::SELECT_STATEMENT;
 }
 
 } // namespace duckdb

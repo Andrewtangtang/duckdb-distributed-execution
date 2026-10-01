@@ -76,7 +76,7 @@ public:
 	DistributedExecutionResult ExecuteDistributed(const string &sql);
 
 private:
-	// Check if query can be distributed.
+	// Whether `sql` is a single SELECT statement. Which operators can be distributed is checked on its plan.
 	bool CanDistribute(const string &sql);
 
 	WorkerManager &worker_manager;

@@ -280,3 +280,25 @@ TEST_CASE("Unsupported aggregates retain fallback", "[partial_aggregate]") {
 		REQUIRE_FALSE(analyzer.AnalyzeQuery(*plan, sql).supports_partitioned_aggregation);
 	}
 }
+
+TEST_CASE("Supported plans are decided by plan operators, not SQL keywords", "[query_utils]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_FALSE(con.Query("CREATE TABLE t(id INTEGER, note VARCHAR)")->HasError());
+	REQUIRE_FALSE(con.Query("INSERT INTO t SELECT range, range::VARCHAR FROM range(10)")->HasError());
+
+	for (const auto &sql : {"SELECT id FROM t WHERE id > 1", "SELECT note, count(*) FROM t GROUP BY note",
+	                        "SELECT id FROM t WHERE note <> 'x ORDER BY y OFFSET 1'"}) {
+		INFO(sql);
+		auto plan = con.ExtractPlan(sql);
+		REQUIRE(plan != nullptr);
+		REQUIRE(IsSupportedPlan(*plan));
+	}
+	for (const auto &sql : {"SELECT id FROM t ORDER BY id", "SELECT id FROM t\nORDER\nBY id", "SELECT id FROM t LIMIT 1",
+	                        "SELECT id FROM t LIMIT 1 OFFSET 1", "SELECT 1", "SELECT id FROM t JOIN t t2 USING (id)"}) {
+		INFO(sql);
+		auto plan = con.ExtractPlan(sql);
+		REQUIRE(plan != nullptr);
+		REQUIRE_FALSE(IsSupportedPlan(*plan));
+	}
+}
