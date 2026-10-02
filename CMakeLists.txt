@@ -45,27 +45,37 @@ if(${BUILD_UNITTESTS})
 endif()
 
 set(UTIL_SOURCES
-    src/utils/catalog_utils.cpp src/utils/network_utils.cpp
-    src/utils/remote_error.cpp src/utils/retry_utils.cpp
-    src/utils/thread_utils.cpp src/utils/time_utils.cpp)
+    src/utils/catalog_utils.cpp
+    src/utils/network_utils.cpp
+    src/utils/remote_error.cpp
+    src/utils/retry_utils.cpp
+    src/utils/sql_render_utils.cpp
+    src/utils/thread_utils.cpp
+    src/utils/time_utils.cpp)
 
 set(CLIENT_EXECUTION_SOURCES
     src/client/execution/distributed_aggregate_pushdown.cpp
     src/client/execution/distributed_alter_table.cpp
     src/client/execution/distributed_client.cpp
     src/client/execution/distributed_create_index.cpp
+    src/client/execution/distributed_query_pushdown.cpp
     src/client/execution/distributed_table_scan_function.cpp
     src/client/execution/logical_remote_alter_table.cpp
     src/client/execution/logical_remote_create_index.cpp
+    src/client/execution/remote_create_table_as.cpp
     src/client/execution/remote_dml.cpp)
 
-set(CLIENT_TRANSPORT_SOURCES src/client/transport/distributed_flight_client.cpp
-                             src/client/transport/transaction_state.cpp)
+set(CLIENT_TRANSPORT_SOURCES
+    src/client/transport/distributed_flight_client.cpp
+    src/client/transport/flight_client_session.cpp
+    src/client/transport/transaction_state.cpp)
 
 set(CLIENT_SOURCES
     ${CLIENT_EXECUTION_SOURCES}
     ${CLIENT_TRANSPORT_SOURCES}
     src/client/duckherder_catalog.cpp
+    src/client/duckherder_catalog_loader.cpp
+    src/client/duckherder_client_sessions.cpp
     src/client/duckherder_connection_state.cpp
     src/client/duckherder_index_catalog_entry.cpp
     src/client/duckherder_pragmas.cpp
@@ -76,13 +86,16 @@ set(CLIENT_SOURCES
     src/client/duckherder_table_catalog_entry.cpp
     src/client/duckherder_transaction.cpp
     src/client/duckherder_transaction_manager.cpp
-    src/client/entry_lookup_info_hash_utils.cpp)
+    src/client/entry_lookup_info_hash_utils.cpp
+    src/client/remote_index_registry.cpp)
 
 set(SERVER_UTIL_SOURCES src/server/object_storage_database.cpp
                         src/server/validation.cpp)
 
 set(SERVER_DRIVER_SOURCES
     src/server/driver/client_registration.cpp
+    src/server/driver/client_registry.cpp
+    src/server/driver/client_request_handler.cpp
     src/server/driver/distributed_executor.cpp
     src/server/driver/distributed_flight_server.cpp
     src/server/driver/distributed_flight_server_test_state.cpp
@@ -91,11 +104,14 @@ set(SERVER_DRIVER_SOURCES
     src/server/driver/worker_node_client.cpp
     src/server/driver/partition_sql_generator.cpp
     src/server/driver/plan_serializer.cpp
+    src/server/driver/query_history.cpp
     src/server/driver/query_plan_analyzer.cpp
     src/server/driver/query_utils.cpp
     src/server/driver/result_merger.cpp
     src/server/driver/served_database.cpp
     src/server/driver/task_partitioner.cpp
+    src/server/driver/transaction_request_handler.cpp
+    src/server/driver/worker_fragment_pushdown.cpp
     src/server/driver/worker_manager.cpp)
 
 set(SERVER_WORKER_SOURCES src/server/worker/worker_node.cpp)
