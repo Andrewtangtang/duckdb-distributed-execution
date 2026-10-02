@@ -11,6 +11,9 @@ WORKER_BIN=${WORKER_BIN:-$ROOT/build/release/extension/duckherder/distributed_wo
 DRIVER_PORT=${DRIVER_PORT:-8815}
 # DuckDB executable on the --driver-ssh host.
 REMOTE_DUCKDB=${REMOTE_DUCKDB:-duckdb}
+# Optional cgroup isolation for local workers (Linux, systemd): one CPU list per worker, e.g. "4-7 8-11 12-15".
+read -r -a worker_cpus <<<"${WORKER_CPUS:-}"
+WORKER_MEMORY=${WORKER_MEMORY:-4G}
 
 SF=1
 WORKER_COUNTS="0 2"
@@ -53,6 +56,19 @@ die() {
 }
 
 port_open() { (echo >"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+
+# Counts the CPUs in a list such as "4-7" or "0,2,4-5".
+cpu_count() {
+	local count=0 part
+	for part in ${1//,/ }; do
+		if [[ $part == *-* ]]; then
+			count=$((count + ${part#*-} - ${part%-*} + 1))
+		else
+			count=$((count + 1))
+		fi
+	done
+	echo "$count"
+}
 
 # Multiplex SSH so polling the remote driver is cheap. The socket path must stay short.
 SSH_OPTS=(-o BatchMode=yes -o ControlMaster=auto -o "ControlPath=/tmp/dh-ssh-%C" -o ControlPersist=120)
@@ -116,6 +132,8 @@ local_ports=()
 [[ -n $DRIVER_SSH ]] || local_ports+=("$DRIVER_PORT")
 if [[ -z $WORKER_HOSTS ]]; then
 	for ((port = DRIVER_PORT + 1; port <= DRIVER_PORT + max_workers; port++)); do local_ports+=("$port"); done
+	((${#worker_cpus[@]} == 0 || max_workers <= ${#worker_cpus[@]})) ||
+		die "--workers needs $max_workers CPU lists in WORKER_CPUS"
 else
 	read -r -a remote_workers <<<"$WORKER_HOSTS"
 	((max_workers <= ${#remote_workers[@]})) || die "--workers needs $max_workers hosts in --worker-hosts"
@@ -162,7 +180,14 @@ for n in $WORKER_COUNTS; do
 	else
 		for ((idx = 1; idx <= n; idx++)); do
 			port=$((DRIVER_PORT + idx))
-			"$WORKER_BIN" 127.0.0.1 "$port" "w$idx" >"$OUT/n$n-worker$idx.log" 2>&1 &
+			launch=("$WORKER_BIN")
+			if ((${#worker_cpus[@]})); then
+				# The CPU quota also tells DuckDB how many threads to start; it ignores the cpuset.
+				cpus=${worker_cpus[idx - 1]}
+				launch=(systemd-run --user --scope --quiet -p "AllowedCPUs=$cpus"
+					-p "CPUQuota=$(($(cpu_count "$cpus") * 100))%" -p "MemoryMax=$WORKER_MEMORY" "$WORKER_BIN")
+			fi
+			"${launch[@]}" 127.0.0.1 "$port" "w$idx" >"$OUT/n$n-worker$idx.log" 2>&1 &
 			worker_pids+=($!)
 			workers+=("127.0.0.1:$port")
 			deadline=$((SECONDS + 30))

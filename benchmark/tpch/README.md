@@ -53,6 +53,19 @@ benchmark/tpch/bench.sh --sf 10 --workers "0 2" --worker-hosts "10.0.0.2:8816 10
 
 The driver host needs key-based SSH from the client and must reach the workers. `bench.sh` runs SSH in batch mode, so connect once by hand first to accept the driver's host key. From a laptop, forward the driver port first (for example `ssh -N -L 8815:10.0.0.1:8815 ...`) and pass `--driver-endpoint localhost:8815`.
 
+## Isolation and simulated latency (Linux)
+
+To keep processes on one machine from competing, set `WORKER_CPUS` to one CPU list per worker; each local worker then runs in its own systemd scope with that `AllowedCPUs`, a matching `CPUQuota`, and `MemoryMax=$WORKER_MEMORY` (default `4G`). Run `bench.sh` itself, which hosts the client and driver, in a scope too. Unprivileged `systemd-run --user` needs the `cpuset` controller delegated to user sessions.
+
+To simulate remote storage latency, build with `LATENCY_INJECTION_FS_DIR` pointing at a [duckdb-filesystem-latency-injection](https://github.com/dentiny/duckdb-filesystem-latency-injection) checkout that supports `LATENCY_INJECT_FS_AUTO_WRAP`, then run with the latency variables set. Workers and the driver inherit them from `bench.sh`.
+
+```sh
+LATENCY_INJECT_FS_AUTO_WRAP=SlateDBFileSystem LATENCY_INJECT_FS_READ_BASE_MEAN_MS=20 \
+WORKER_CPUS="2-3 4-5 6-7" WORKER_MEMORY=4G \
+systemd-run --user --scope -p AllowedCPUs=0-1 -p CPUQuota=200% -p MemoryMax=4G \
+  benchmark/tpch/bench.sh --sf 10 --workers "0 1 2 3" --skip-verify
+```
+
 ## Output
 
 Each run writes `results/<time>-sf<sf>/`:
