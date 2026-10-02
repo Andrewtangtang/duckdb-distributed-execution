@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Time the 22 TPC-H queries through a duckherder driver.
-# Usage: run.sh <label> <driver_host:port> <s3://bucket/root>   (source rustfs.env or aws.env first)
+# Usage: run.sh <label> <driver_host:port> <s3://bucket/root>   (source rustfs.env first)
 # Writes <label>.log and <label>.csv (query,run,seconds). Run 0 of each query is a warm-up; set REPS for more runs.
 set -euo pipefail
 LABEL=$1

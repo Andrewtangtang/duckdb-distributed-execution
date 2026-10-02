@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Check that the 22 TPC-H queries through duckherder match plain DuckDB on the file load.sh generated.
-# Usage: verify.sh <driver_host:port> <s3://bucket/root> <tpch_file>   (source rustfs.env or aws.env first)
+# Usage: verify.sh <driver_host:port> <s3://bucket/root> <tpch_file>   (source rustfs.env first)
 set -euo pipefail
 ENDPOINT=$1
 DATA_PATH=$2

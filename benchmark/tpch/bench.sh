@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
-# Run the TPC-H benchmark end to end on one machine: load the data once, then for each worker count start the
-# workers and driver, verify results, time the queries, and stop everything.
-# Usage: bench.sh [--sf N] [--workers "0 2"] [--reps N] [--env FILE] [--data-path s3://...] [--skip-verify]
-# Needs an S3 endpoint whose bucket exists, e.g. local RustFS for the default rustfs.env.
+# Run the TPC-H benchmark end to end: load the data once, then for each worker count start the driver with that many
+# workers, verify results, time the queries, and stop the driver. See README.md for options.
 # Results go to results/<time>-sf<N>/: metadata.json, n<N>.csv/.log, verify-n<N>.txt, process logs, summary.csv.
 set -euo pipefail
-set -m # Give each background job its own process group so the driver pipeline can be stopped as a whole.
 
 DIR=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$DIR/../.." && pwd)
 export DUCKDB=${DUCKDB:-$ROOT/build/release/duckdb}
 WORKER_BIN=${WORKER_BIN:-$ROOT/build/release/extension/duckherder/distributed_worker}
 DRIVER_PORT=${DRIVER_PORT:-8815}
+# DuckDB executable on the --driver-ssh host.
+REMOTE_DUCKDB=${REMOTE_DUCKDB:-duckdb}
 
 SF=1
 WORKER_COUNTS="0 2"
@@ -19,6 +18,10 @@ REPS=5
 ENV_FILE=$DIR/rustfs.env
 DATA_PATH=""
 VERIFY=1
+LOAD=1
+WORKER_HOSTS=""
+DRIVER_SSH=""
+ENDPOINT=""
 while (($#)); do
 	case $1 in
 	--sf) SF=$2 && shift 2 ;;
@@ -27,10 +30,15 @@ while (($#)); do
 	--env) ENV_FILE=$2 && shift 2 ;;
 	--data-path) DATA_PATH=$2 && shift 2 ;;
 	--skip-verify) VERIFY=0 && shift ;;
+	--no-load) LOAD=0 && shift ;;
+	--worker-hosts) WORKER_HOSTS=$2 && shift 2 ;;
+	--driver-ssh) DRIVER_SSH=$2 && shift 2 ;;
+	--driver-endpoint) ENDPOINT=$2 && shift 2 ;;
 	*) echo "Unknown option: $1" >&2 && exit 1 ;;
 	esac
 done
 DATA_PATH=${DATA_PATH:-s3://duckherder/tpch-sf$SF}
+ENDPOINT=${ENDPOINT:-localhost:$DRIVER_PORT}
 # shellcheck source=/dev/null
 source "$ENV_FILE"
 
@@ -39,45 +47,92 @@ OUT=$DIR/results/$(date +%Y%m%d-%H%M%S)-sf$SF
 mkdir -p "$WORK" "$OUT"
 export TPCH_FILE=$WORK/tpch_sf$SF.duckdb
 
-port_open() { (echo >"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
-
-wait_for() {
-	local deadline=$((SECONDS + $1)) what=$2
-	shift 2
-	until "$@"; do
-		if ((SECONDS >= deadline)); then
-			echo "Timed out waiting for $what" >&2
-			exit 1
-		fi
-		sleep 0.2
-	done
+die() {
+	echo "$*" >&2
+	exit 1
 }
 
-pids=()
+port_open() { (echo >"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+
+# Multiplex SSH so polling the remote driver is cheap. The socket path must stay short.
+SSH_OPTS=(-o BatchMode=yes -o ControlMaster=auto -o "ControlPath=/tmp/dh-ssh-%C" -o ControlPersist=120)
+remote() { ssh "${SSH_OPTS[@]}" "$DRIVER_SSH" "$@"; }
+REMOTE_STATE=/tmp/duckherder-driver-$DRIVER_PORT
+
+worker_pids=()
+driver_pid=""
+driver_pidfile=""
+driver_readyfile=""
+
+start_driver() {
+	local log=$1
+	shift
+	if [[ -z $DRIVER_SSH ]]; then
+		driver_pidfile=${log%.log}.pid
+		driver_readyfile=${log%.log}.ready
+		READY_FILE=$driver_readyfile PID_FILE=$driver_pidfile "$DIR/driver.sh" "$DRIVER_PORT" "$@" >"$log" 2>&1 &
+	else
+		remote "rm -f $REMOTE_STATE.ready $REMOTE_STATE.pid"
+		remote "DUCKDB='$REMOTE_DUCKDB' READY_FILE=$REMOTE_STATE.ready PID_FILE=$REMOTE_STATE.pid bash -s -- $DRIVER_PORT $*" \
+			<"$DIR/driver.sh" >"$log" 2>&1 &
+	fi
+	driver_pid=$!
+}
+
+# Prints the registered worker count once the driver is ready, or nothing before that.
+driver_ready() {
+	if [[ -z $DRIVER_SSH ]]; then
+		cat "$driver_readyfile" 2>/dev/null || true
+	else
+		remote "cat $REMOTE_STATE.ready 2>/dev/null" || true
+	fi
+}
+
+stop_driver() {
+	[[ -n $driver_pid ]] || return 0
+	if [[ -z $DRIVER_SSH ]]; then
+		[[ -f $driver_pidfile ]] && kill "$(cat "$driver_pidfile")" 2>/dev/null
+	else
+		remote "kill \$(cat $REMOTE_STATE.pid)" 2>/dev/null
+	fi || kill "$driver_pid" 2>/dev/null || true
+	wait "$driver_pid" 2>/dev/null || true
+	driver_pid=""
+}
+
 stop_all() {
-	for pid in ${pids[@]+"${pids[@]}"}; do
-		kill -- -"$pid" 2>/dev/null || true
+	stop_driver
+	for pid in ${worker_pids[@]+"${worker_pids[@]}"}; do
+		kill "$pid" 2>/dev/null || true
+		wait "$pid" 2>/dev/null || true
 	done
-	wait 2>/dev/null || true
-	pids=()
+	worker_pids=()
 }
 trap stop_all EXIT
 
-# Leftover processes would answer on these ports and silently replace the ones started here.
+# Leftover local processes would answer on these ports and silently replace the ones started here.
 max_workers=0
 for n in $WORKER_COUNTS; do ((n > max_workers)) && max_workers=$n; done
-for ((port = DRIVER_PORT; port <= DRIVER_PORT + max_workers; port++)); do
-	if port_open "$port"; then
-		echo "Port $port is in use; stop the running driver or worker first." >&2
-		exit 1
-	fi
+local_ports=()
+[[ -n $DRIVER_SSH ]] || local_ports+=("$DRIVER_PORT")
+if [[ -z $WORKER_HOSTS ]]; then
+	for ((port = DRIVER_PORT + 1; port <= DRIVER_PORT + max_workers; port++)); do local_ports+=("$port"); done
+else
+	read -r -a remote_workers <<<"$WORKER_HOSTS"
+	((max_workers <= ${#remote_workers[@]})) || die "--workers needs $max_workers hosts in --worker-hosts"
+fi
+for port in ${local_ports[@]+"${local_ports[@]}"}; do
+	port_open "$port" && die "Port $port is in use; stop the running driver or worker first."
 done
 
 # Load once per data path. ObjFS allows one writer, and the driver opens the database read-write, so load first.
 marker=$WORK/.loaded-$(echo "$DATA_PATH" | tr -c 'a-zA-Z0-9\n' _)
-if [[ ! -f $marker ]]; then
+if ((LOAD)) && [[ ! -f $marker ]]; then
 	"$DIR/load.sh" "$SF" "$DATA_PATH" | tee "$OUT/load.log"
 	touch "$marker"
+fi
+# verify.sh compares against this file; with --no-load it may not exist yet.
+if ((VERIFY)) && [[ ! -f $TPCH_FILE ]]; then
+	"$DUCKDB" "$TPCH_FILE" -c "CALL dbgen(sf = $SF);" >/dev/null
 fi
 
 cat >"$OUT/metadata.json" <<EOF
@@ -89,8 +144,11 @@ cat >"$OUT/metadata.json" <<EOF
   "worker_counts": "$WORKER_COUNTS",
   "reps": $REPS,
   "data_path": "$DATA_PATH",
-  "host": "$(uname -sm)",
-  "cpus": $(getconf _NPROCESSORS_ONLN),
+  "driver_endpoint": "$ENDPOINT",
+  "driver_ssh": "$DRIVER_SSH",
+  "worker_hosts": "$WORKER_HOSTS",
+  "client_host": "$(uname -sm)",
+  "client_cpus": $(getconf _NPROCESSORS_ONLN),
   "started_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 EOF
@@ -99,32 +157,39 @@ failed=()
 for n in $WORKER_COUNTS; do
 	echo "== $n workers"
 	workers=()
-	for ((idx = 1; idx <= n; idx++)); do
-		port=$((DRIVER_PORT + idx))
-		"$WORKER_BIN" 127.0.0.1 "$port" "w$idx" >"$OUT/n$n-worker$idx.log" 2>&1 &
-		pids+=($!)
-		workers+=("127.0.0.1:$port")
-		wait_for 30 "worker on port $port (see $OUT/n$n-worker$idx.log)" port_open "$port"
-	done
-
-	ready=$OUT/n$n-driver.ready
-	READY_FILE=$ready "$DIR/driver.sh" "$DRIVER_PORT" ${workers[@]+"${workers[@]}"} >"$OUT/n$n-driver.log" 2>&1 &
-	pids+=($!)
-	wait_for 60 "driver (see $OUT/n$n-driver.log)" test -s "$ready"
-	registered=$(tr -d '[:space:]' <"$ready")
-	if [[ $registered != "$n" ]]; then
-		echo "Driver registered $registered workers, expected $n" >&2
-		exit 1
+	if [[ -n $WORKER_HOSTS ]]; then
+		workers=(${remote_workers[@]+"${remote_workers[@]:0:n}"})
+	else
+		for ((idx = 1; idx <= n; idx++)); do
+			port=$((DRIVER_PORT + idx))
+			"$WORKER_BIN" 127.0.0.1 "$port" "w$idx" >"$OUT/n$n-worker$idx.log" 2>&1 &
+			worker_pids+=($!)
+			workers+=("127.0.0.1:$port")
+			deadline=$((SECONDS + 30))
+			until port_open "$port"; do
+				((SECONDS < deadline)) || die "Timed out waiting for worker on port $port (see $OUT/n$n-worker$idx.log)"
+				sleep 0.2
+			done
+		done
 	fi
+
+	start_driver "$OUT/n$n-driver.log" ${workers[@]+"${workers[@]}"}
+	deadline=$((SECONDS + 60))
+	until registered=$(driver_ready) && [[ -n $registered ]]; do
+		kill -0 "$driver_pid" 2>/dev/null || die "Driver exited during startup (see $OUT/n$n-driver.log)"
+		((SECONDS < deadline)) || die "Timed out waiting for the driver (see $OUT/n$n-driver.log)"
+		sleep 0.5
+	done
+	registered=$(echo "$registered" | tr -d '[:space:]')
+	[[ $registered == "$n" ]] || die "Driver registered $registered workers, expected $n"
 
 	if ((VERIFY)); then
 		mkdir -p "$OUT/verify-n$n"
-		if ! OUT=$OUT/verify-n$n "$DIR/verify.sh" "localhost:$DRIVER_PORT" "$DATA_PATH" "$TPCH_FILE" |
-			tee "$OUT/verify-n$n.txt"; then
+		if ! OUT=$OUT/verify-n$n "$DIR/verify.sh" "$ENDPOINT" "$DATA_PATH" "$TPCH_FILE" | tee "$OUT/verify-n$n.txt"; then
 			failed+=("verify with $n workers")
 		fi
 	fi
-	REPS=$REPS "$DIR/run.sh" "$OUT/n$n" "localhost:$DRIVER_PORT" "$DATA_PATH"
+	REPS=$REPS "$DIR/run.sh" "$OUT/n$n" "$ENDPOINT" "$DATA_PATH"
 	stop_all
 done
 

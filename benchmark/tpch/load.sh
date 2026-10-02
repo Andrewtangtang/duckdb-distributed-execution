@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Generate TPC-H data into a local .duckdb file, then copy it into the ObjFS database `tpch` at DATA_PATH.
-# Usage: load.sh <sf> <s3://bucket/root>   (source rustfs.env or aws.env first)
+# Usage: load.sh <sf> <s3://bucket/root>   (source rustfs.env first)
 # Run it before starting the driver: ObjFS allows one writer, and the driver opens the database read-write.
 set -euo pipefail
 SF=$1
