@@ -15,6 +15,7 @@
 #include "duckdb/parser/parser.hpp"
 #include "query_common.hpp"
 #include "server/object_storage_database.hpp"
+#include "server/startup_sql.hpp"
 #include "server/validation.hpp"
 #include "transaction_constants.hpp"
 #include "utils/remote_error.hpp"
@@ -138,6 +139,10 @@ void DistributedFlightServer::Initialize() {
 	db = make_shared_ptr<DuckDB>(nullptr, nullptr);
 	// Loadable extensions use DuckDB's dummy loader, so initialize core functions explicitly.
 	db->LoadStaticExtension<CoreFunctionsExtension>();
+	auto startup_status = RunStartupSQL(*db);
+	if (!startup_status.ok()) {
+		throw IOException(startup_status.ToString());
+	}
 
 	// Initialize the worker manager. Each client registration owns its connection-bound executor.
 	worker_manager = make_uniq<WorkerManager>(*db);
