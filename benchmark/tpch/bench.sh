@@ -11,13 +11,18 @@ WORKER_BIN=${WORKER_BIN:-$ROOT/build/release/extension/duckherder/distributed_wo
 DRIVER_PORT=${DRIVER_PORT:-8815}
 # DuckDB executable on the --driver-ssh host.
 REMOTE_DUCKDB=${REMOTE_DUCKDB:-duckdb}
-# Optional cgroup isolation for local workers (Linux, systemd): one CPU list per worker, e.g. "4-7 8-11 12-15".
+# Optional cgroup isolation for local processes (Linux, systemd): one CPU list per worker, e.g. "4-7 8-11 12-15", and
+# one for the driver, e.g. "8-9". The client stays in whatever cgroup bench.sh runs in.
 read -r -a worker_cpus <<<"${WORKER_CPUS:-}"
 WORKER_MEMORY=${WORKER_MEMORY:-4G}
+DRIVER_CPUS=${DRIVER_CPUS:-}
+DRIVER_MEMORY=${DRIVER_MEMORY:-4G}
 
 SF=1
 WORKER_COUNTS="0 2"
 REPS=5
+WARMUP=1
+COLD=0
 ENV_FILE=$DIR/rustfs.env
 DATA_PATH=""
 VERIFY=1
@@ -30,6 +35,8 @@ while (($#)); do
 	--sf) SF=$2 && shift 2 ;;
 	--workers) WORKER_COUNTS=$2 && shift 2 ;;
 	--reps) REPS=$2 && shift 2 ;;
+	--warmup) WARMUP=$2 && shift 2 ;;
+	--cold) COLD=1 && shift ;;
 	--env) ENV_FILE=$2 && shift 2 ;;
 	--data-path) DATA_PATH=$2 && shift 2 ;;
 	--skip-verify) VERIFY=0 && shift ;;
@@ -42,6 +49,8 @@ while (($#)); do
 done
 DATA_PATH=${DATA_PATH:-s3://duckherder/tpch-sf$SF}
 ENDPOINT=${ENDPOINT:-localhost:$DRIVER_PORT}
+# Cold runs restart every process before each query, so there is nothing to warm up.
+((COLD)) && WARMUP=0
 # shellcheck source=/dev/null
 source "$ENV_FILE"
 
@@ -70,6 +79,19 @@ cpu_count() {
 	echo "$count"
 }
 
+# Runs a command limited to the given CPUs and memory through a systemd scope, or plainly without CPUs. Only call it
+# in the background: it replaces the current shell so that $! is the process itself.
+launch_limited() {
+	local cpus=$1 memory=$2
+	shift 2
+	if [[ -z $cpus ]]; then
+		exec "$@"
+	fi
+	# The CPU quota also tells DuckDB how many threads to start; it ignores the cpuset.
+	exec systemd-run --user --scope --quiet -p "AllowedCPUs=$cpus" -p "CPUQuota=$(($(cpu_count "$cpus") * 100))%" \
+		-p "MemoryMax=$memory" "$@"
+}
+
 # Multiplex SSH so polling the remote driver is cheap. The socket path must stay short.
 SSH_OPTS=(-o BatchMode=yes -o ControlMaster=auto -o "ControlPath=/tmp/dh-ssh-%C" -o ControlPersist=120)
 remote() { ssh "${SSH_OPTS[@]}" "$DRIVER_SSH" "$@"; }
@@ -86,7 +108,10 @@ start_driver() {
 	if [[ -z $DRIVER_SSH ]]; then
 		driver_pidfile=${log%.log}.pid
 		driver_readyfile=${log%.log}.ready
-		READY_FILE=$driver_readyfile PID_FILE=$driver_pidfile "$DIR/driver.sh" "$DRIVER_PORT" "$@" >"$log" 2>&1 &
+		# Restarts reuse these paths; stale files would look like the new driver's.
+		rm -f "$driver_readyfile" "$driver_pidfile"
+		launch_limited "$DRIVER_CPUS" "$DRIVER_MEMORY" env READY_FILE="$driver_readyfile" PID_FILE="$driver_pidfile" \
+			"$DIR/driver.sh" "$DRIVER_PORT" "$@" >"$log" 2>&1 &
 	else
 		remote "rm -f $REMOTE_STATE.ready $REMOTE_STATE.pid"
 		remote "DUCKDB='$REMOTE_DUCKDB' READY_FILE=$REMOTE_STATE.ready PID_FILE=$REMOTE_STATE.pid bash -s -- $DRIVER_PORT $*" \
@@ -117,8 +142,9 @@ stop_driver() {
 
 stop_all() {
 	stop_driver
+	# Workers attach read-only and keep no state. SIGTERM makes them abort in their signal handler, so skip it.
 	for pid in ${worker_pids[@]+"${worker_pids[@]}"}; do
-		kill "$pid" 2>/dev/null || true
+		kill -KILL "$pid" 2>/dev/null || true
 		wait "$pid" 2>/dev/null || true
 	done
 	worker_pids=()
@@ -161,6 +187,14 @@ cat >"$OUT/metadata.json" <<EOF
   "sf": $SF,
   "worker_counts": "$WORKER_COUNTS",
   "reps": $REPS,
+  "warmup": $WARMUP,
+  "cold": $COLD,
+  "worker_cpus": "${WORKER_CPUS:-}",
+  "worker_memory": "$WORKER_MEMORY",
+  "driver_cpus": "$DRIVER_CPUS",
+  "driver_memory": "$DRIVER_MEMORY",
+  "latency_auto_wrap": "${LATENCY_INJECT_FS_AUTO_WRAP:-}",
+  "latency_read_base_mean_ms": "${LATENCY_INJECT_FS_READ_BASE_MEAN_MS:-}",
   "data_path": "$DATA_PATH",
   "driver_endpoint": "$ENDPOINT",
   "driver_ssh": "$DRIVER_SSH",
@@ -171,23 +205,16 @@ cat >"$OUT/metadata.json" <<EOF
 }
 EOF
 
-failed=()
-for n in $WORKER_COUNTS; do
-	echo "== $n workers"
-	workers=()
+# Starts the driver with n workers (local workers are started too) and waits until all are registered.
+start_cluster() {
+	local n=$1 idx port registered deadline workers=()
 	if [[ -n $WORKER_HOSTS ]]; then
 		workers=(${remote_workers[@]+"${remote_workers[@]:0:n}"})
 	else
 		for ((idx = 1; idx <= n; idx++)); do
 			port=$((DRIVER_PORT + idx))
-			launch=("$WORKER_BIN")
-			if ((${#worker_cpus[@]})); then
-				# The CPU quota also tells DuckDB how many threads to start; it ignores the cpuset.
-				cpus=${worker_cpus[idx - 1]}
-				launch=(systemd-run --user --scope --quiet -p "AllowedCPUs=$cpus"
-					-p "CPUQuota=$(($(cpu_count "$cpus") * 100))%" -p "MemoryMax=$WORKER_MEMORY" "$WORKER_BIN")
-			fi
-			"${launch[@]}" 127.0.0.1 "$port" "w$idx" >"$OUT/n$n-worker$idx.log" 2>&1 &
+			launch_limited "${worker_cpus[idx - 1]:-}" "$WORKER_MEMORY" "$WORKER_BIN" 127.0.0.1 "$port" "w$idx" \
+				>"$OUT/n$n-worker$idx.log" 2>&1 &
 			worker_pids+=($!)
 			workers+=("127.0.0.1:$port")
 			deadline=$((SECONDS + 30))
@@ -207,22 +234,45 @@ for n in $WORKER_COUNTS; do
 	done
 	registered=$(echo "$registered" | tr -d '[:space:]')
 	[[ $registered == "$n" ]] || die "Driver registered $registered workers, expected $n"
+}
 
+failed=()
+for n in $WORKER_COUNTS; do
+	echo "== $n workers"
+	start_cluster "$n"
 	if ((VERIFY)); then
 		mkdir -p "$OUT/verify-n$n"
 		if ! OUT=$OUT/verify-n$n "$DIR/verify.sh" "$ENDPOINT" "$DATA_PATH" "$TPCH_FILE" | tee "$OUT/verify-n$n.txt"; then
 			failed+=("verify with $n workers")
 		fi
 	fi
-	REPS=$REPS "$DIR/run.sh" "$OUT/n$n" "$ENDPOINT" "$DATA_PATH"
-	stop_all
+	if ((COLD)); then
+		# Restart every process before each run, so that no run reads data cached by an earlier one.
+		stop_all
+		mkdir -p "$OUT/cold-n$n"
+		echo "query,run,seconds" >"$OUT/n$n.csv"
+		for q in $(seq 1 22); do
+			printf 'Q%s ' "$q"
+			for ((r = 0; r < REPS; r++)); do
+				start_cluster "$n"
+				QUERIES=$q WARMUP=0 REPS=1 "$DIR/run.sh" "$OUT/cold-n$n/q$q-r$r" "$ENDPOINT" "$DATA_PATH" >/dev/null
+				awk -F, -v r="$r" 'NR > 1 { print $1 "," r "," $3 }' "$OUT/cold-n$n/q$q-r$r.csv" >>"$OUT/n$n.csv"
+				stop_all
+			done
+		done
+		echo
+		echo "Wrote $OUT/n$n.csv; per-run logs in $OUT/cold-n$n"
+	else
+		WARMUP=$WARMUP REPS=$REPS "$DIR/run.sh" "$OUT/n$n" "$ENDPOINT" "$DATA_PATH"
+		stop_all
+	fi
 done
 
-# Median seconds per query (columns are worker counts), excluding each query's warm-up run.
+# Median seconds per query (columns are worker counts), excluding warm-up runs.
 "$DUCKDB" -c "
 CREATE TABLE timings AS
 SELECT regexp_extract(filename, 'n([0-9]+)\.csv', 1)::INTEGER AS workers, query, seconds
-FROM read_csv('$OUT/n*.csv', filename = true) WHERE run > 0;
+FROM read_csv('$OUT/n*.csv', filename = true) WHERE run >= $WARMUP;
 COPY (PIVOT timings ON workers USING median(seconds) GROUP BY query ORDER BY query) TO '$OUT/summary.csv';
 FROM read_csv('$OUT/summary.csv');"
 

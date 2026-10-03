@@ -31,7 +31,9 @@ Requires Docker Desktop, `pkgconf`, `cargo`, and vcpkg. Run everything from the 
 | --- | --- | --- |
 | `--sf` | `1` | TPC-H scale factor |
 | `--workers` | `"0 2"` | Worker counts to run |
-| `--reps` | `5` | Measured runs per query, after one warm-up |
+| `--reps` | `5` | Measured runs per query |
+| `--warmup` | `1` | Warm-up runs per query before the measured ones; excluded from `summary.csv` |
+| `--cold` | off | Restart the driver and workers before every run, so each run reads from storage instead of DuckDB's buffer pool; no warm-up |
 | `--data-path` | `s3://duckherder/tpch-sf<sf>` | Where the ObjFS database lives |
 | `--env` | `rustfs.env` | File that sets `S3_SETUP_SQL`, the SQL creating the S3 secret `s3` |
 | `--skip-verify` | off | Skip the result check |
@@ -55,15 +57,17 @@ The driver host needs key-based SSH from the client and must reach the workers. 
 
 ## Isolation and simulated latency (Linux)
 
-To keep processes on one machine from competing, set `WORKER_CPUS` to one CPU list per worker; each local worker then runs in its own systemd scope with that `AllowedCPUs`, a matching `CPUQuota`, and `MemoryMax=$WORKER_MEMORY` (default `4G`). Run `bench.sh` itself, which hosts the client and driver, in a scope too. Unprivileged `systemd-run --user` needs the `cpuset` controller delegated to user sessions.
+To keep processes on one machine from competing, set `WORKER_CPUS` to one CPU list per worker and `DRIVER_CPUS` to one for the driver. Each then runs in its own systemd scope with that `AllowedCPUs`, a matching `CPUQuota`, and `MemoryMax` from `WORKER_MEMORY` or `DRIVER_MEMORY` (default `4G`). The client stays in the cgroup `bench.sh` runs in, so run `bench.sh` itself in a scope too. Unprivileged `systemd-run --user` needs the `cpuset` controller delegated to user sessions.
+
+Simulated latency only affects reads that miss DuckDB's buffer pool, so without `--cold` it mostly shows in the first run of each query.
 
 To simulate remote storage latency, build with `LATENCY_INJECTION_FS_DIR` pointing at a [duckdb-filesystem-latency-injection](https://github.com/dentiny/duckdb-filesystem-latency-injection) checkout that supports `LATENCY_INJECT_FS_AUTO_WRAP`, then run with the latency variables set. Workers and the driver inherit them from `bench.sh`.
 
 ```sh
 LATENCY_INJECT_FS_AUTO_WRAP=SlateDBFileSystem LATENCY_INJECT_FS_READ_BASE_MEAN_MS=20 \
-WORKER_CPUS="2-3 4-5 6-7" WORKER_MEMORY=4G \
+WORKER_CPUS="2-3 4-5 6-7" WORKER_MEMORY=4G DRIVER_CPUS=8-9 DRIVER_MEMORY=4G \
 systemd-run --user --scope -p AllowedCPUs=0-1 -p CPUQuota=200% -p MemoryMax=4G \
-  benchmark/tpch/bench.sh --sf 10 --workers "0 1 2 3" --skip-verify
+  benchmark/tpch/bench.sh --sf 10 --workers "0 1 2 3" --skip-verify --cold
 ```
 
 ## Output

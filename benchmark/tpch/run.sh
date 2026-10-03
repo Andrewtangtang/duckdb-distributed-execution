@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# Time the 22 TPC-H queries through a duckherder driver.
+# Time TPC-H queries through a duckherder driver.
 # Usage: run.sh <label> <driver_host:port> <s3://bucket/root>   (source rustfs.env first)
-# Writes <label>.log and <label>.csv (query,run,seconds). Run 0 of each query is a warm-up; set REPS for more runs.
+# Writes <label>.log and <label>.csv (query,run,seconds). Each query runs WARMUP (default 1) warm-up times, numbered
+# from 0, then REPS (default 5) measured times. QUERIES selects the queries (default 1 to 22).
 set -euo pipefail
 LABEL=$1
 ENDPOINT=$2
 DATA_PATH=$3
 REPS=${REPS:-5}
+WARMUP=${WARMUP:-1}
+QUERIES=${QUERIES:-$(seq 1 22)}
 DUCKDB=${DUCKDB:-$(cd "$(dirname "$0")/../.." && pwd)/build/release/duckdb}
 
 {
@@ -16,8 +19,8 @@ DUCKDB=${DUCKDB:-$(cd "$(dirname "$0")/../.." && pwd)/build/release/duckdb}
 	# Discard results without printing them; the client still fetches every row.
 	echo ".mode trash"
 	echo ".timer on"
-	for q in $(seq 1 22); do
-		for r in $(seq 0 "$REPS"); do
+	for q in $QUERIES; do
+		for ((r = 0; r < WARMUP + REPS; r++)); do
 			echo ".print q=$q run=$r"
 			echo "PRAGMA tpch($q);"
 		done
