@@ -12,7 +12,7 @@ DRIVER_PORT=${DRIVER_PORT:-8815}
 # DuckDB executable on the --driver-ssh host.
 REMOTE_DUCKDB=${REMOTE_DUCKDB:-duckdb}
 # Optional cgroup isolation for local processes (Linux, systemd): one CPU list per worker, e.g. "4-7 8-11 12-15", and
-# one for the driver, e.g. "8-9". The client stays in whatever cgroup bench.sh runs in.
+# one for the driver, e.g. "8-9".
 read -r -a worker_cpus <<<"${WORKER_CPUS:-}"
 WORKER_MEMORY=${WORKER_MEMORY:-4G}
 DRIVER_CPUS=${DRIVER_CPUS:-}
