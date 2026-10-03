@@ -179,6 +179,9 @@ if ((VERIFY)) && [[ ! -f $TPCH_FILE ]]; then
 	"$DUCKDB" "$TPCH_FILE" -c "CALL dbgen(sf = $SF);" >/dev/null
 fi
 
+# Every latency_inject_fs setting taken from the environment, as JSON members.
+latency_json=$(env | grep '^LATENCY_INJECT_FS_' | sort |
+	awk '{ i = index($0, "="); printf "%s\"%s\": \"%s\"", (NR > 1 ? ", " : ""), substr($0, 1, i - 1), substr($0, i + 1) }' || true)
 cat >"$OUT/metadata.json" <<EOF
 {
   "commit": "$(git -C "$ROOT" rev-parse HEAD)",
@@ -193,8 +196,7 @@ cat >"$OUT/metadata.json" <<EOF
   "worker_memory": "$WORKER_MEMORY",
   "driver_cpus": "$DRIVER_CPUS",
   "driver_memory": "$DRIVER_MEMORY",
-  "latency_auto_wrap": "${LATENCY_INJECT_FS_AUTO_WRAP:-}",
-  "latency_read_base_mean_ms": "${LATENCY_INJECT_FS_READ_BASE_MEAN_MS:-}",
+  "latency_injection": {$latency_json},
   "data_path": "$DATA_PATH",
   "driver_endpoint": "$ENDPOINT",
   "driver_ssh": "$DRIVER_SSH",
