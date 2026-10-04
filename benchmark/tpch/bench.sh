@@ -20,6 +20,7 @@ DRIVER_MEMORY=${DRIVER_MEMORY:-4G}
 
 SF=1
 WORKER_COUNTS="0 2"
+QUERIES=${QUERIES:-$(seq 1 22)}
 REPS=5
 WARMUP=1
 COLD=0
@@ -34,6 +35,7 @@ while (($#)); do
 	case $1 in
 	--sf) SF=$2 && shift 2 ;;
 	--workers) WORKER_COUNTS=$2 && shift 2 ;;
+	--queries) QUERIES=$2 && shift 2 ;;
 	--reps) REPS=$2 && shift 2 ;;
 	--warmup) WARMUP=$2 && shift 2 ;;
 	--cold) COLD=1 && shift ;;
@@ -46,6 +48,10 @@ while (($#)); do
 	--driver-endpoint) ENDPOINT=$2 && shift 2 ;;
 	*) echo "Unknown option: $1" >&2 && exit 1 ;;
 	esac
+done
+[[ -n ${QUERIES//[[:space:]]/} ]] || { echo "No TPC-H queries selected" >&2; exit 1; }
+for q in $QUERIES; do
+	[[ $q =~ ^([1-9]|1[0-9]|2[0-2])$ ]] || { echo "Invalid TPC-H query: $q" >&2; exit 1; }
 done
 DATA_PATH=${DATA_PATH:-s3://duckherder/tpch-sf$SF}
 ENDPOINT=${ENDPOINT:-localhost:$DRIVER_PORT}
@@ -181,6 +187,7 @@ fi
 
 # DUCKHERDER_STARTUP_SQL as a JSON string.
 startup_sql_json=$(printf '%s' "${DUCKHERDER_STARTUP_SQL:-}" | python3 -c 'import json, sys; print(json.dumps(sys.stdin.read()))')
+queries_json=$(printf '%s' "$QUERIES" | python3 -c 'import json, sys; print(json.dumps([int(q) for q in sys.stdin.read().split()]))')
 cat >"$OUT/metadata.json" <<EOF
 {
   "commit": "$(git -C "$ROOT" rev-parse HEAD)",
@@ -188,6 +195,7 @@ cat >"$OUT/metadata.json" <<EOF
   "duckdb": "$("$DUCKDB" -noheader -list -c 'SELECT version()')",
   "sf": $SF,
   "worker_counts": "$WORKER_COUNTS",
+  "queries": $queries_json,
   "reps": $REPS,
   "warmup": $WARMUP,
   "cold": $COLD,
@@ -243,16 +251,16 @@ for n in $WORKER_COUNTS; do
 	start_cluster "$n"
 	if ((VERIFY)); then
 		mkdir -p "$OUT/verify-n$n"
-		if ! OUT=$OUT/verify-n$n "$DIR/verify.sh" "$ENDPOINT" "$DATA_PATH" "$TPCH_FILE" | tee "$OUT/verify-n$n.txt"; then
+		if ! QUERIES="$QUERIES" OUT=$OUT/verify-n$n "$DIR/verify.sh" "$ENDPOINT" "$DATA_PATH" "$TPCH_FILE" | tee "$OUT/verify-n$n.txt"; then
 			failed+=("verify with $n workers")
 		fi
 	fi
 	if ((COLD)); then
-		# Restart every process before each run, so that no run reads data cached by an earlier one.
+		# Restart processes before each run; OS and storage-server caches can persist.
 		stop_all
 		mkdir -p "$OUT/cold-n$n"
 		echo "query,run,seconds" >"$OUT/n$n.csv"
-		for q in $(seq 1 22); do
+		for q in $QUERIES; do
 			printf 'Q%s ' "$q"
 			for ((r = 0; r < REPS; r++)); do
 				start_cluster "$n"
@@ -264,7 +272,7 @@ for n in $WORKER_COUNTS; do
 		echo
 		echo "Wrote $OUT/n$n.csv; per-run logs in $OUT/cold-n$n"
 	else
-		WARMUP=$WARMUP REPS=$REPS "$DIR/run.sh" "$OUT/n$n" "$ENDPOINT" "$DATA_PATH"
+		QUERIES="$QUERIES" WARMUP=$WARMUP REPS=$REPS "$DIR/run.sh" "$OUT/n$n" "$ENDPOINT" "$DATA_PATH"
 		stop_all
 	fi
 done

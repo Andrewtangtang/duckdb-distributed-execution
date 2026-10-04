@@ -22,8 +22,9 @@ def same(left, right):
 
 def main():
     out = Path(sys.argv[1])
+    queries = [int(q) for q in sys.argv[2:]] if len(sys.argv) > 2 else range(1, 23)
     failed = []
-    for q in range(1, 23):
+    for q in queries:
         actual, expected = rows(out / f"dh_q{q}.csv"), rows(out / f"ref_q{q}.csv")
         ok = len(actual) == len(expected) and all(
             len(a) == len(e) and all(map(same, a, e)) for a, e in zip(actual, expected)
@@ -31,7 +32,7 @@ def main():
         if not ok:
             print(f"Q{q:02d} MISMATCH ({len(actual)} vs {len(expected)} rows)")
             failed.append(q)
-    print(f"verify: {22 - len(failed)}/22 queries match (results in {out})")
+    print(f"verify: {len(queries) - len(failed)}/{len(queries)} queries match (results in {out})")
     sys.exit(1 if failed else 0)
 
 

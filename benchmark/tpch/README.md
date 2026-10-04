@@ -42,9 +42,10 @@ systemd-run --user --scope -p AllowedCPUs=0-1 -p CPUQuota=200% -p MemoryMax=4G \
 | --- | --- | --- |
 | `--sf` | `1` | TPC-H scale factor |
 | `--workers` | `"0 2"` | Worker counts to run; with 0 the driver runs queries itself |
+| `--queries` | all 22 | TPC-H query numbers to verify and time, e.g. `--queries "19"` |
 | `--reps` | `5` | Measured runs per query |
 | `--warmup` | `1` | Warm-up runs per query, excluded from `summary.csv` |
-| `--cold` | off | Restart the driver and workers before every run, so no run reuses data cached by an earlier one; no warm-up |
+| `--cold` | off | Restart the driver and workers before every measured run; no warm-up. OS and storage-server caches may persist. |
 | `--data-path` | `s3://duckherder/tpch-sf<sf>` | Where the ObjFS database lives; loaded on first use unless `--no-load` |
 | `--env` | `rustfs.env` | File that sets `S3_SETUP_SQL`, the SQL creating the S3 secret `s3` |
 | `--skip-verify` | off | Skip checking results against plain DuckDB |
