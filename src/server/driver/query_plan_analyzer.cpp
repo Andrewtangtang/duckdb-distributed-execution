@@ -2,9 +2,11 @@
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/result_modifier.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/logical_operator.hpp"
@@ -18,9 +20,41 @@ namespace duckdb {
 
 namespace {
 
-// Rewrites a pushed aggregate, `SELECT <groups>, <aggregates> FROM <table> [WHERE ...] [GROUP BY 1, ..., k]` (see
-// `distributed_aggregate_pushdown.cpp`), into partial aggregates per row group and the query merging them.
-// Returns false for any other query.
+// For scalar arithmetic over SUMs (Q14), compute each SUM on workers and apply arithmetic after merging.
+// Keep this narrow: unsupported expressions still use the local query path.
+bool RewriteSumArithmetic(unique_ptr<ParsedExpression> &expr,
+                          vector<unique_ptr<ParsedExpression>> &partial_list) {
+	if (expr->GetExpressionClass() != ExpressionClass::FUNCTION) {
+		return expr->GetExpressionClass() == ExpressionClass::CONSTANT;
+	}
+	auto &function = expr->Cast<FunctionExpression>();
+	if (!function.is_operator) {
+		if (function.function_name != "sum" || function.distinct || function.filter ||
+		    (function.order_bys && !function.order_bys->orders.empty())) {
+			return false;
+		}
+		const auto column = StringUtil::Format("__c%llu", partial_list.size());
+		auto partial = expr->Copy();
+		partial->SetAlias(column);
+		partial_list.push_back(std::move(partial));
+		vector<unique_ptr<ParsedExpression>> children;
+		children.push_back(make_uniq<ColumnRefExpression>(column));
+		expr = make_uniq<FunctionExpression>("sum", std::move(children));
+		return true;
+	}
+	if (function.function_name != "*" && function.function_name != "/") {
+		return false;
+	}
+	for (auto &child : function.children) {
+		if (!RewriteSumArithmetic(child, partial_list)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// Rewrite directly selected aggregates, Q12-style grouped ORDER BY, and Q14-style arithmetic over SUMs.
+// Unsupported shapes retain local execution.
 bool BuildPartialAggregation(const SelectStatement &original, QueryPlanAnalyzer::QueryAnalysis &analysis) {
 	auto copy = original.Copy();
 	auto &statement = copy->Cast<SelectStatement>();
@@ -28,15 +62,37 @@ bool BuildPartialAggregation(const SelectStatement &original, QueryPlanAnalyzer:
 		return false;
 	}
 	auto &select = statement.node->Cast<SelectNode>();
-	const auto &groups = select.groups.group_expressions;
-	if (select.having || !select.modifiers.empty() || select.groups.grouping_sets.size() > 1) {
+	auto &groups = select.groups.group_expressions;
+	if (select.having || select.groups.grouping_sets.size() > 1) {
 		return false;
 	}
-	for (idx_t idx = 0; idx < groups.size(); ++idx) {
-		if (groups[idx]->GetExpressionClass() != ExpressionClass::CONSTANT ||
-		    groups[idx]->Cast<ConstantExpression>().value != Value::INTEGER(NumericCast<int32_t>(idx + 1))) {
+	if (groups.size() > select.select_list.size()) {
+		return false;
+	}
+	string final_order;
+	if (!select.modifiers.empty()) {
+		// Q12: a single ascending ORDER BY on the first output group column.
+		if (select.modifiers.size() != 1 || select.modifiers[0]->type != ResultModifierType::ORDER_MODIFIER ||
+		    groups.empty()) {
 			return false;
 		}
+		const auto &order = select.modifiers[0]->Cast<OrderModifier>();
+		if (order.orders.size() != 1 ||
+		    (order.orders[0].type != OrderType::ORDER_DEFAULT && order.orders[0].type != OrderType::ASCENDING) ||
+		    order.orders[0].null_order != OrderByNullType::ORDER_DEFAULT ||
+		    !order.orders[0].expression->Equals(*select.select_list[0])) {
+			return false;
+		}
+		final_order = " ORDER BY 1";
+		select.modifiers.clear();
+	}
+	for (idx_t idx = 0; idx < groups.size(); ++idx) {
+		const bool ordinal = groups[idx]->GetExpressionClass() == ExpressionClass::CONSTANT &&
+		                     groups[idx]->Cast<ConstantExpression>().value == Value::INTEGER(NumericCast<int32_t>(idx + 1));
+		if (!ordinal && !groups[idx]->Equals(*select.select_list[idx])) {
+			return false;
+		}
+		groups[idx] = make_uniq<ConstantExpression>(Value::INTEGER(NumericCast<int32_t>(idx + 1)));
 	}
 
 	vector<unique_ptr<ParsedExpression>> partial_list;
@@ -47,8 +103,17 @@ bool BuildPartialAggregation(const SelectStatement &original, QueryPlanAnalyzer:
 		if (idx < groups.size()) {
 			final_list.push_back(column);
 		} else {
-			if (expr->GetExpressionClass() != ExpressionClass::FUNCTION) {
-				return false;
+			if (expr->GetExpressionClass() != ExpressionClass::FUNCTION ||
+			    expr->Cast<FunctionExpression>().is_operator) {
+				if (!groups.empty() || idx != 0 || select.select_list.size() != 1) {
+					return false;
+				}
+				const auto start = partial_list.size();
+				if (!RewriteSumArithmetic(expr, partial_list) || partial_list.size() == start) {
+					return false;
+				}
+				final_list.push_back(expr->ToString());
+				continue;
 			}
 			auto &function = expr->Cast<FunctionExpression>();
 			const auto name = function.function_name;
@@ -80,8 +145,8 @@ bool BuildPartialAggregation(const SelectStatement &original, QueryPlanAnalyzer:
 	select.select_list = std::move(partial_list);
 	analysis.partial_sql = statement.ToString();
 	// Group columns are exactly the non-aggregate outputs.
-	analysis.final_sql = StringUtil::Format("SELECT %s FROM %s GROUP BY ALL", StringUtil::Join(final_list, ", "),
-	                                        QueryPlanAnalyzer::PARTIAL_TABLE_NAME);
+	analysis.final_sql = StringUtil::Format("SELECT %s FROM %s GROUP BY ALL%s", StringUtil::Join(final_list, ", "),
+	                                        QueryPlanAnalyzer::PARTIAL_TABLE_NAME, final_order);
 	return true;
 }
 

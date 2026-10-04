@@ -151,6 +151,12 @@ TEST_CASE("Local ObjFS scans assign contiguous whole row groups", "[task_partiti
 		    writer.Query("ATTACH 'duckdb_objfs://partition.db' AS object_db (ROW_GROUP_SIZE 2048)")->HasError());
 		REQUIRE_FALSE(writer.Query("CREATE TABLE object_db.t AS SELECT i AS id FROM range(10000) t(i)")->HasError());
 		REQUIRE_FALSE(writer.Query("CREATE TABLE object_db.tiny AS SELECT i AS id FROM range(8) t(i)")->HasError());
+		REQUIRE_FALSE(writer.Query("CREATE TABLE object_db.customer (id INTEGER)")->HasError());
+		REQUIRE_FALSE(writer.Query("CREATE TABLE object_db.orders (id INTEGER)")->HasError());
+		REQUIRE_FALSE(writer.Query("CREATE TABLE object_db.lineitem AS SELECT "
+		                           "CASE WHEN i = 0 THEN NULL ELSE floor(i / 3)::BIGINT END AS l_orderkey "
+		                           "FROM range(10000) t(i)")
+		                  ->HasError());
 	}
 	{
 		DuckDB reader_db(nullptr);
@@ -159,6 +165,7 @@ TEST_CASE("Local ObjFS scans assign contiguous whole row groups", "[task_partiti
 		REQUIRE_FALSE(reader.Query("SET duckdb_objfs_backend = 'local'")->HasError());
 		REQUIRE_FALSE(reader.Query(StringUtil::Format("SET duckdb_objfs_root = '%s'", root.string()))->HasError());
 		REQUIRE_FALSE(reader.Query("ATTACH 'duckdb_objfs://partition.db' AS object_db (READ_ONLY)")->HasError());
+		REQUIRE_FALSE(reader.Query("USE object_db")->HasError());
 		QueryPlanAnalyzer analyzer(reader);
 		TaskPartitioner partitioner(reader, analyzer);
 
@@ -188,6 +195,25 @@ TEST_CASE("Local ObjFS scans assign contiguous whole row groups", "[task_partiti
 		}
 		REQUIRE(next_row_group == row_group_info.total_row_groups);
 		REQUIRE(rows == 10000);
+
+		// A key crossing a row-group boundary stays in one task, and the first task keeps NULL keys.
+		auto range_tasks = partitioner.ExtractOrderKeyRangeTasks("SELECT l_orderkey FROM lineitem", 3);
+		REQUIRE(range_tasks.size() == 3);
+		REQUIRE(StringUtil::Contains(range_tasks[0].task_sql, "IS NULL"));
+		rows = 0;
+		idx_t owners_of_boundary_key = 0;
+		for (const auto &task : range_tasks) {
+			auto result = reader.Query(StringUtil::Format("SELECT count(*) FROM (%s)", task.task_sql));
+			REQUIRE_FALSE(result->HasError());
+			rows += result->GetValue(0, 0).GetValue<idx_t>();
+			result = reader.Query(StringUtil::Format("SELECT count(*) FROM (%s) WHERE l_orderkey = 682", task.task_sql));
+			REQUIRE_FALSE(result->HasError());
+			const auto boundary_rows = result->GetValue(0, 0).GetValue<idx_t>();
+			REQUIRE((boundary_rows == 0 || boundary_rows == 3));
+			owners_of_boundary_key += boundary_rows == 3;
+		}
+		REQUIRE(rows == 10000);
+		REQUIRE(owners_of_boundary_key == 1);
 	}
 	std::filesystem::remove_all(root);
 }
@@ -287,6 +313,46 @@ TEST_CASE("Partial aggregate SQL preserves global aggregate semantics", "[partia
 	}
 }
 
+TEST_CASE("Grouped join sorting and arithmetic over sums merge across partitions", "[partial_aggregate]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_FALSE(con.Query("CREATE TABLE fact(id INTEGER, key INTEGER, amount DECIMAL(10, 2), mode VARCHAR)")->HasError());
+	REQUIRE_FALSE(con.Query("CREATE TABLE dim(key INTEGER, promo BOOLEAN, priority VARCHAR)")->HasError());
+	REQUIRE_FALSE(con.Query("INSERT INTO fact VALUES (1, 1, 10, 'MAIL'), (2, 2, 20, 'SHIP'), "
+	                        "(3, 1, 30, 'MAIL'), (4, 2, 40, 'SHIP')")->HasError());
+	REQUIRE_FALSE(con.Query("INSERT INTO dim VALUES (1, true, 'HIGH'), (2, false, 'LOW')")->HasError());
+	for (const auto &sql : {
+	         "SELECT f.mode, sum(CASE WHEN d.priority = 'HIGH' THEN 1 ELSE 0 END) AS high_count, "
+	         "sum(CASE WHEN d.priority <> 'HIGH' THEN 1 ELSE 0 END) AS low_count "
+	         "FROM fact f JOIN dim d ON f.key = d.key GROUP BY f.mode ORDER BY f.mode",
+	         "SELECT 100.00 * sum(CASE WHEN d.promo THEN f.amount ELSE 0 END) / sum(f.amount) AS promo "
+	         "FROM fact f JOIN dim d ON f.key = d.key"}) {
+		INFO(sql);
+		auto analysis = AnalyzeQuery(con, sql);
+		REQUIRE(analysis.supports_partitioned_aggregation);
+		REQUIRE_FALSE(con.Query(StringUtil::Format("CREATE OR REPLACE TEMP TABLE %s AS SELECT * FROM (%s) WHERE false",
+		                                           QueryPlanAnalyzer::PARTIAL_TABLE_NAME, analysis.partial_sql))
+		                  ->HasError());
+		for (const auto &predicate : {"f.rowid < 2", "f.rowid >= 2"}) {
+			auto task_sql = PartitionSQLGenerator::InjectWhereClause(analysis.partial_sql, predicate);
+			REQUIRE_FALSE(con.Query(StringUtil::Format("INSERT INTO %s %s", QueryPlanAnalyzer::PARTIAL_TABLE_NAME,
+			                                       task_sql))
+			                  ->HasError());
+		}
+		auto expected = con.Query(sql);
+		auto actual = con.Query(analysis.final_sql);
+		REQUIRE_FALSE(expected->HasError());
+		REQUIRE_FALSE(actual->HasError());
+		REQUIRE(actual->RowCount() == expected->RowCount());
+		for (idx_t row = 0; row < expected->RowCount(); ++row) {
+			for (idx_t col = 0; col < expected->ColumnCount(); ++col) {
+				REQUIRE(Value::NotDistinctFrom(actual->GetValue(col, row).DefaultCastAs(expected->types[col]),
+				                               expected->GetValue(col, row)));
+			}
+		}
+	}
+}
+
 TEST_CASE("Unsupported aggregates retain fallback", "[partial_aggregate]") {
 	DuckDB db(nullptr);
 	Connection con(db);
@@ -294,7 +360,6 @@ TEST_CASE("Unsupported aggregates retain fallback", "[partial_aggregate]") {
 	for (const auto &sql :
 	     {"SELECT median(value) FROM aggregates", "SELECT sum(DISTINCT value) FROM aggregates",
 	      "SELECT sum(value) FILTER (WHERE value > 0) FROM aggregates", "SELECT avg(span) FROM aggregates",
-	      "SELECT category, sum(value) FROM aggregates GROUP BY category",
 	      "SELECT category, sum(value) FROM aggregates GROUP BY 1 HAVING sum(value) > 0",
 	      "SELECT category, sum(value) FROM aggregates GROUP BY ROLLUP (1)", "SELECT sum(value) + 1 FROM aggregates"}) {
 		INFO(sql);
@@ -309,7 +374,8 @@ TEST_CASE("Supported plans are decided by plan operators, not SQL keywords", "[q
 	REQUIRE_FALSE(con.Query("INSERT INTO t SELECT range, range::VARCHAR FROM range(10)")->HasError());
 
 	for (const auto &sql : {"SELECT id FROM t WHERE id > 1", "SELECT note, count(*) FROM t GROUP BY note",
-	                        "SELECT id FROM t JOIN t t2 USING (id)",
+	                        "SELECT id FROM t JOIN t t2 USING (id)", "SELECT id FROM t ORDER BY id",
+	                        "SELECT id FROM t\nORDER\nBY id",
 	                        "SELECT id FROM t WHERE note <> 'x ORDER BY y OFFSET 1'"}) {
 		INFO(sql);
 		auto plan = con.ExtractPlan(sql);
@@ -317,8 +383,7 @@ TEST_CASE("Supported plans are decided by plan operators, not SQL keywords", "[q
 		REQUIRE(IsSupportedPlan(*plan));
 	}
 	for (const auto &sql :
-	     {"SELECT id FROM t ORDER BY id", "SELECT id FROM t\nORDER\nBY id", "SELECT id FROM t LIMIT 1",
-	      "SELECT id FROM t LIMIT 1 OFFSET 1", "SELECT 1"}) {
+	     {"SELECT id FROM t LIMIT 1", "SELECT id FROM t LIMIT 1 OFFSET 1", "SELECT 1"}) {
 		INFO(sql);
 		auto plan = con.ExtractPlan(sql);
 		REQUIRE(plan != nullptr);

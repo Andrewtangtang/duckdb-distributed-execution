@@ -5,11 +5,13 @@
 #include "server/driver/query_plan_analyzer.hpp"
 
 #include <algorithm>
-#include <functional>
+#include <cstdio>
+#include <cstdlib>
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/parser/column_definition.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/comparison_expression.hpp"
@@ -19,6 +21,10 @@
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/statistics/numeric_stats.hpp"
+#include "duckdb/storage/table/row_group.hpp"
+#include "duckdb/storage/table/row_group_collection.hpp"
 
 namespace duckdb {
 
@@ -113,6 +119,109 @@ vector<DistributedPipelineTask> TaskPartitioner::CreateSingleTask(const string &
 	task.row_group_start = 0;
 	task.row_group_end = 0;
 	tasks.emplace_back(std::move(task));
+	return tasks;
+}
+
+vector<DistributedPipelineTask> TaskPartitioner::ExtractOrderKeyRangeTasks(const string &sql, idx_t num_workers) {
+	auto reject = [](const char *reason) {
+		if (std::getenv("DUCKHERDER_PROFILE_DISTRIBUTED")) {
+			std::fprintf(stderr, "PROFILE q3_range rejected=%s\n", reason);
+		}
+		return vector<DistributedPipelineTask> {};
+	};
+	if (num_workers < 2) {
+		return reject("workers");
+	}
+	// Only read l_orderkey row-group metadata. pragma_storage_info materializes every column segment.
+	vector<int64_t> lows;
+	int64_t previous_hi = -1;
+	bool ordered = true;
+	bool has_nulls = false;
+	try {
+		conn.context->RunFunctionInTransaction([&]() {
+			TableCatalogEntry *lineitem = nullptr;
+			for (const auto &name : {"customer", "orders", "lineitem"}) {
+				auto &entry = Catalog::GetEntry(*conn.context, INVALID_CATALOG, DEFAULT_SCHEMA,
+				                                EntryLookupInfo(CatalogType::TABLE_ENTRY, name));
+				auto &table = entry.Cast<TableCatalogEntry>();
+				if (!table.IsDuckTable() || !StringUtil::CIEquals(table.catalog.GetName(), "object_db") ||
+				    !StringUtil::CIEquals(table.schema.name, "main")) {
+					ordered = false;
+					return;
+				}
+				if (StringUtil::CIEquals(name, "lineitem")) {
+					lineitem = &table;
+				}
+			}
+			if (!lineitem || !lineitem->ColumnExists("l_orderkey")) {
+				ordered = false;
+				return;
+			}
+			const auto &column = lineitem->GetColumn("l_orderkey");
+			if (column.Type() != LogicalType::INTEGER && column.Type() != LogicalType::BIGINT) {
+				ordered = false;
+				return;
+			}
+			auto row_groups = lineitem->GetStorage().GetRowGroupCollection()->GetRowGroups();
+			for (auto segment = row_groups->GetRootSegment(); segment; segment = row_groups->GetNextSegment(*segment)) {
+				auto stats = segment->GetNode().GetStatistics(column.StorageOid());
+				if (!stats || !NumericStats::HasMinMax(*stats)) {
+					ordered = false;
+					return;
+				}
+				has_nulls |= stats->CanHaveNull();
+				const auto lo = NumericStats::Min(*stats).GetValue<int64_t>();
+				const auto hi = NumericStats::Max(*stats).GetValue<int64_t>();
+				if (lo < 0 || hi < lo || (!lows.empty() && lo < previous_hi)) {
+					ordered = false;
+					return;
+				}
+				lows.push_back(lo);
+				previous_hi = hi;
+			}
+		});
+	} catch (const Exception &) {
+		return reject("stats_error");
+	}
+	if (!ordered || lows.size() < num_workers) {
+		return reject("stats");
+	}
+	vector<int64_t> cutoffs;
+	for (idx_t worker = 1; worker < num_workers; ++worker) {
+		const auto cutoff = lows[lows.size() * worker / num_workers];
+		if (cutoff <= lows.front() || (!cutoffs.empty() && cutoff <= cutoffs.back())) {
+			return reject("cutoff");
+		}
+		cutoffs.push_back(cutoff);
+	}
+	if (std::getenv("DUCKHERDER_PROFILE_DISTRIBUTED")) {
+		std::fprintf(stderr, "PROFILE q3_range groups=%llu tasks=%llu\n",
+		             static_cast<unsigned long long>(lows.size()), static_cast<unsigned long long>(num_workers));
+	}
+	vector<DistributedPipelineTask> tasks;
+	tasks.reserve(num_workers);
+	for (idx_t worker = 0; worker < num_workers; ++worker) {
+		string predicate;
+		if (worker) {
+			predicate = StringUtil::Format("lineitem.l_orderkey >= %lld", static_cast<long long>(cutoffs[worker - 1]));
+		}
+		if (worker + 1 < num_workers) {
+			if (!predicate.empty()) {
+				predicate += " AND ";
+			}
+			if (worker == 0 && has_nulls) {
+				predicate = StringUtil::Format("(lineitem.l_orderkey < %lld OR lineitem.l_orderkey IS NULL)",
+				                               static_cast<long long>(cutoffs[worker]));
+			} else {
+				predicate += StringUtil::Format("lineitem.l_orderkey < %lld", static_cast<long long>(cutoffs[worker]));
+			}
+		}
+		DistributedPipelineTask task;
+		task.task_id = worker;
+		task.total_tasks = num_workers;
+		task.task_sql = PartitionSQLGenerator::InjectWhereClause(sql, predicate);
+		tasks.push_back(std::move(task));
+	}
 	return tasks;
 }
 

@@ -21,6 +21,10 @@ public:
 	vector<DistributedPipelineTask> ExtractPipelineTasks(LogicalOperator &logical_plan, const string &base_sql,
 	                                                     idx_t num_workers);
 
+	// Q3: use the ordered lineitem.l_orderkey row-group statistics to assign complete keys to workers.
+	// Returns no tasks when the data is not ordered or statistics are unavailable.
+	vector<DistributedPipelineTask> ExtractOrderKeyRangeTasks(const string &sql, idx_t num_workers);
+
 private:
 	// Create a single non-distributed task.
 	vector<DistributedPipelineTask> CreateSingleTask(const string &base_sql);

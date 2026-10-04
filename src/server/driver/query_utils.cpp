@@ -37,6 +37,7 @@ bool IsSupportedPlan(LogicalOperator &op) {
 	switch (op.type) {
 	case LogicalOperatorType::LOGICAL_PROJECTION:
 	case LogicalOperatorType::LOGICAL_FILTER:
+	case LogicalOperatorType::LOGICAL_ORDER_BY:
 	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
 		if (op.children.size() != 1) {
 			return false;

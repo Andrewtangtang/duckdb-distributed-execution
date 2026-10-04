@@ -10,8 +10,12 @@
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/result_modifier.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/logical_operator.hpp"
@@ -24,6 +28,7 @@
 #include "server/driver/query_utils.hpp"
 #include "server/driver/worker_manager.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <future>
@@ -36,6 +41,87 @@ using ProfileClock = std::chrono::steady_clock;
 
 double ProfileMs(ProfileClock::time_point start, ProfileClock::time_point end) {
 	return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+bool IsColumn(const ParsedExpression &expression, const string &name) {
+	return expression.GetExpressionClass() == ExpressionClass::COLUMN_REF &&
+	       StringUtil::CIEquals(expression.Cast<ColumnRefExpression>().GetColumnName(), name);
+}
+
+bool CollectInnerJoinTables(const TableRef &ref, vector<string> &names) {
+	if (ref.type == TableReferenceType::BASE_TABLE) {
+		const auto &table = ref.Cast<BaseTableRef>();
+		if ((!table.catalog_name.empty() && !StringUtil::CIEquals(table.catalog_name, "object_db")) ||
+		    (!table.schema_name.empty() && !StringUtil::CIEquals(table.schema_name, "main")) || !table.alias.empty()) {
+			return false;
+		}
+		names.push_back(table.table_name);
+		return true;
+	}
+	if (ref.type != TableReferenceType::JOIN) {
+		return false;
+	}
+	const auto &join = ref.Cast<JoinRef>();
+	return join.type == JoinType::INNER && CollectInnerJoinTables(*join.left, names) &&
+	       CollectInnerJoinTables(*join.right, names);
+}
+
+// Keep the first storage-range experiment limited to the exact structural shape of TPC-H Q3.
+// Each aggregate group contains l_orderkey, so disjoint key ranges yield complete local groups and safe Top-K.
+bool IsQ3RangeCandidate(const SelectStatement &statement) {
+	if (statement.node->type != QueryNodeType::SELECT_NODE || !statement.named_param_map.empty()) {
+		return false;
+	}
+	const auto &select = statement.node->Cast<SelectNode>();
+	if (!select.from_table || !select.cte_map.map.empty() || select.having || select.sample ||
+	    select.select_list.size() != 4 || select.groups.group_expressions.size() != 3 ||
+	    select.modifiers.size() != 2) {
+		return false;
+	}
+	vector<string> tables;
+	if (!CollectInnerJoinTables(*select.from_table, tables) || tables.size() != 3) {
+		return false;
+	}
+	std::sort(tables.begin(), tables.end());
+	if (tables != vector<string>({"customer", "lineitem", "orders"}) ||
+	    !IsColumn(*select.select_list[0], "l_orderkey") ||
+	    select.select_list[1]->GetExpressionClass() != ExpressionClass::FUNCTION ||
+	    !StringUtil::CIEquals(select.select_list[1]->Cast<FunctionExpression>().function_name, "sum") ||
+	    !IsColumn(*select.select_list[2], "o_orderdate") ||
+	    !IsColumn(*select.select_list[3], "o_shippriority")) {
+		return false;
+	}
+	for (const auto &name : {"l_orderkey", "o_orderdate", "o_shippriority"}) {
+		bool found = false;
+		for (const auto &group : select.groups.group_expressions) {
+			found |= IsColumn(*group, name);
+		}
+		if (!found) {
+			return false;
+		}
+	}
+	const OrderModifier *order = nullptr;
+	const LimitModifier *limit = nullptr;
+	for (const auto &modifier : select.modifiers) {
+		if (modifier->type == ResultModifierType::ORDER_MODIFIER) {
+			order = &modifier->Cast<OrderModifier>();
+		} else if (modifier->type == ResultModifierType::LIMIT_MODIFIER) {
+			limit = &modifier->Cast<LimitModifier>();
+		} else {
+			return false;
+		}
+	}
+	if (!order || !limit || !limit->limit || limit->offset || limit->limit->ToString() != "10" ||
+	    order->orders.size() != 2) {
+		return false;
+	}
+	const bool matches_order = IsColumn(*order->orders[0].expression, "revenue") &&
+	       order->orders[0].type == OrderType::DESCENDING &&
+	       order->orders[0].null_order == OrderByNullType::ORDER_DEFAULT &&
+	       IsColumn(*order->orders[1].expression, "o_orderdate") &&
+	       (order->orders[1].type == OrderType::ASCENDING || order->orders[1].type == OrderType::ORDER_DEFAULT) &&
+	       order->orders[1].null_order == OrderByNullType::ORDER_DEFAULT;
+	return matches_order;
 }
 
 } // namespace
@@ -84,6 +170,7 @@ DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string 
 		return exec_result;
 	}
 	const auto &statement = parser.statements[0]->Cast<SelectStatement>();
+	const bool q3_range = require_partitioned_join && IsQ3RangeCandidate(statement);
 	if (require_partitioned_join) {
 		// Reject unsupported joins before ExtractPlan: planning a second time can fail for complex
 		// queries even when their already-prepared local plan is executable (e.g. TPC-H Q2).
@@ -91,14 +178,16 @@ DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string 
 			return exec_result;
 		}
 		const auto &select = statement.node->Cast<SelectNode>();
-		if (!select.from_table || select.from_table->type != TableReferenceType::JOIN ||
-		    !select.cte_map.map.empty() || !select.modifiers.empty() || select.sample) {
+		if (!q3_range && (!select.from_table || select.from_table->type != TableReferenceType::JOIN ||
+		                  !select.cte_map.map.empty() || select.sample)) {
 			return exec_result;
 		}
-		const auto &join = select.from_table->Cast<JoinRef>();
-		if (join.type != JoinType::INNER || join.left->type != TableReferenceType::BASE_TABLE ||
-		    join.right->type != TableReferenceType::BASE_TABLE) {
-			return exec_result;
+		if (!q3_range) {
+			const auto &join = select.from_table->Cast<JoinRef>();
+			if (join.type != JoinType::INNER || join.left->type != TableReferenceType::BASE_TABLE ||
+			    join.right->type != TableReferenceType::BASE_TABLE) {
+				return exec_result;
+			}
 		}
 	}
 
@@ -109,18 +198,31 @@ DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string 
 	}
 
 	// Phase 1: Plan extraction and validation
-	unique_ptr<LogicalOperator> logical_plan = conn.ExtractPlan(sql);
-	if (logical_plan == nullptr) {
-		return exec_result;
-	}
-	if (!IsSupportedPlan(*logical_plan)) {
-		DUCKDB_LOG_DEBUG(db_instance,
-		                 StringUtil::Format("Logical plan for query '%s' contains unsupported operators", sql));
-		return exec_result;
+	unique_ptr<LogicalOperator> logical_plan;
+	if (!q3_range) {
+		logical_plan = conn.ExtractPlan(sql);
+		if (logical_plan == nullptr) {
+			return exec_result;
+		}
+		if (!IsSupportedPlan(*logical_plan)) {
+			DUCKDB_LOG_DEBUG(db_instance,
+			                 StringUtil::Format("Logical plan for query '%s' contains unsupported operators", sql));
+			return exec_result;
+		}
 	}
 
 	// Analyze query to determine merge strategy
-	QueryPlanAnalyzer::QueryAnalysis query_analysis = plan_analyzer->AnalyzeQuery(*logical_plan, statement);
+	QueryPlanAnalyzer::QueryAnalysis query_analysis;
+	if (q3_range) {
+		query_analysis.supports_partitioned_aggregation = true;
+		query_analysis.has_aggregation = true;
+		query_analysis.merge_strategy = QueryPlanAnalyzer::MergeStrategy::GROUP_BY_MERGE;
+		query_analysis.partial_sql = sql;
+		query_analysis.final_sql = StringUtil::Format("SELECT * FROM %s ORDER BY 2 DESC, 3 LIMIT 10",
+		                                                  QueryPlanAnalyzer::PARTIAL_TABLE_NAME);
+	} else {
+		query_analysis = plan_analyzer->AnalyzeQuery(*logical_plan, statement);
+	}
 	auto profile_plan = ProfileClock::now();
 	const bool partitioned_aggregation = query_analysis.supports_partitioned_aggregation &&
 	                                     storage_config.storage_case() != distributed::StorageConfig::STORAGE_NOT_SET;
@@ -133,7 +235,8 @@ DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string 
 	// Phase 2: Extract pipeline tasks and distribute to workers
 	// This replaces the old 1-partition-per-worker approach with flexible task distribution
 	const idx_t partition_workers = query_analysis.has_aggregation && !partitioned_aggregation ? 1 : workers.size();
-	auto tasks = task_partitioner->ExtractPipelineTasks(*logical_plan, execution_sql, partition_workers);
+	auto tasks = q3_range ? task_partitioner->ExtractOrderKeyRangeTasks(execution_sql, partition_workers)
+	                      : task_partitioner->ExtractPipelineTasks(*logical_plan, execution_sql, partition_workers);
 	if (tasks.empty()) {
 		return exec_result;
 	}
