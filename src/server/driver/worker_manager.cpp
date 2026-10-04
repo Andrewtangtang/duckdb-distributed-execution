@@ -3,6 +3,9 @@
 #include "server/driver/worker_manager.hpp"
 #include "utils/network_utils.hpp"
 
+#include <algorithm>
+#include <thread>
+
 namespace duckdb {
 
 arrow::Status WorkerManager::RegisterWorker(const string &worker_id, const string &location) {
@@ -76,6 +79,8 @@ arrow::Status WorkerManager::StartLocalWorkers(idx_t num_workers) {
 	auto &db_instance = *db.instance;
 
 	DUCKDB_LOG_DEBUG(db_instance, "Starting %llu local worker nodes", num_workers);
+	const idx_t cores = std::max<idx_t>(1, std::thread::hardware_concurrency());
+	const idx_t threads_per_worker = num_workers ? std::max<idx_t>(1, (cores + num_workers - 1) / num_workers) : 0;
 
 	for (idx_t idx = 0; idx < num_workers; ++idx) {
 		int port = GetAvailablePort(next_local_worker_port);
@@ -84,7 +89,7 @@ arrow::Status WorkerManager::StartLocalWorkers(idx_t num_workers) {
 		}
 
 		string worker_id = StringUtil::Format("worker_%llu", next_local_worker_id++);
-		auto worker = make_uniq<WorkerNode>(worker_id, "localhost", port);
+		auto worker = make_uniq<WorkerNode>(worker_id, "localhost", port, threads_per_worker);
 
 		auto status = worker->Start();
 		if (!status.ok()) {

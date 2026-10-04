@@ -192,6 +192,56 @@ TEST_CASE("Local ObjFS scans assign contiguous whole row groups", "[task_partiti
 	std::filesystem::remove_all(root);
 }
 
+TEST_CASE("Two-table inner join partitions one input and merges partial sums", "[task_partitioner]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_FALSE(con.Query("CREATE TABLE fact AS SELECT i AS id, i % 17 AS key, i % 7 AS amount, "
+	                        "i % 3 = 0 AS keep FROM range(250000) t(i)")->HasError());
+	REQUIRE_FALSE(con.Query("CREATE TABLE dim AS SELECT i AS key, i + 1 AS multiplier, "
+	                        "CASE WHEN i % 3 = 0 THEN 'A' ELSE 'B' END AS brand FROM range(17) t(i)")
+	                  ->HasError());
+	REQUIRE_FALSE(con.Query("DELETE FROM fact WHERE id >= 10000 AND id < 20000")->HasError());
+	QueryPlanAnalyzer analyzer(con);
+	TaskPartitioner partitioner(con, analyzer);
+	for (const auto &sql : {
+	         "SELECT sum(f.amount * d.multiplier) AS revenue FROM fact f, dim d "
+	         "WHERE f.key = d.key AND (f.keep OR d.key = 3)",
+	         "SELECT sum(f.amount * d.multiplier) AS revenue FROM fact f, dim d "
+	         "WHERE (f.key = d.key AND d.brand = 'A' AND f.keep) OR "
+	         "(f.key = d.key AND d.brand = 'B' AND f.id % 5 = 0)",
+	         "SELECT sum(f.amount * d.multiplier) AS revenue FROM fact f, dim d "
+	         "WHERE (f.key = d.key AND f.keep) OR (f.key = d.key AND d.brand = 'B' AND f.id % 5 = 0)"}) {
+		INFO(sql);
+		auto plan = con.ExtractPlan(sql);
+		REQUIRE(plan != nullptr);
+		REQUIRE(IsSupportedPlan(*plan));
+		auto statements = con.ExtractStatements(sql);
+		auto analysis = analyzer.AnalyzeQuery(*plan, statements[0]->Cast<SelectStatement>());
+		REQUIRE(analysis.supports_partitioned_aggregation);
+		auto tasks = partitioner.ExtractPipelineTasks(*plan, analysis.partial_sql, 3);
+		REQUIRE(tasks.size() == 3);
+		REQUIRE_FALSE(con.Query(StringUtil::Format("CREATE OR REPLACE TEMP TABLE %s AS SELECT * FROM (%s) WHERE false",
+		                                           QueryPlanAnalyzer::PARTIAL_TABLE_NAME, analysis.partial_sql))
+		                  ->HasError());
+		for (auto &task : tasks) {
+			REQUIRE_FALSE(con.Query(StringUtil::Format("INSERT INTO %s %s", QueryPlanAnalyzer::PARTIAL_TABLE_NAME,
+			                                           task.task_sql))
+			                  ->HasError());
+		}
+		auto expected = con.Query(sql);
+		auto actual = con.Query(analysis.final_sql);
+		REQUIRE_FALSE(expected->HasError());
+		REQUIRE_FALSE(actual->HasError());
+		REQUIRE(Value::NotDistinctFrom(actual->GetValue(0, 0).DefaultCastAs(expected->types[0]),
+		                               expected->GetValue(0, 0)));
+	}
+
+	const string outer_sql = "SELECT sum(f.amount) FROM fact f LEFT JOIN dim d ON f.key = d.key";
+	auto plan = con.ExtractPlan(outer_sql);
+	REQUIRE(plan != nullptr);
+	REQUIRE_FALSE(IsSupportedPlan(*plan));
+}
+
 TEST_CASE("Partial aggregate SQL preserves global aggregate semantics", "[partial_aggregate]") {
 	DuckDB db(nullptr);
 	Connection con(db);
@@ -259,6 +309,7 @@ TEST_CASE("Supported plans are decided by plan operators, not SQL keywords", "[q
 	REQUIRE_FALSE(con.Query("INSERT INTO t SELECT range, range::VARCHAR FROM range(10)")->HasError());
 
 	for (const auto &sql : {"SELECT id FROM t WHERE id > 1", "SELECT note, count(*) FROM t GROUP BY note",
+	                        "SELECT id FROM t JOIN t t2 USING (id)",
 	                        "SELECT id FROM t WHERE note <> 'x ORDER BY y OFFSET 1'"}) {
 		INFO(sql);
 		auto plan = con.ExtractPlan(sql);
@@ -267,7 +318,7 @@ TEST_CASE("Supported plans are decided by plan operators, not SQL keywords", "[q
 	}
 	for (const auto &sql :
 	     {"SELECT id FROM t ORDER BY id", "SELECT id FROM t\nORDER\nBY id", "SELECT id FROM t LIMIT 1",
-	      "SELECT id FROM t LIMIT 1 OFFSET 1", "SELECT 1", "SELECT id FROM t JOIN t t2 USING (id)"}) {
+	      "SELECT id FROM t LIMIT 1 OFFSET 1", "SELECT 1"}) {
 		INFO(sql);
 		auto plan = con.ExtractPlan(sql);
 		REQUIRE(plan != nullptr);

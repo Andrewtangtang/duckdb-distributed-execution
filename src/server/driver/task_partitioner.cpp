@@ -5,18 +5,100 @@
 #include "server/driver/query_plan_analyzer.hpp"
 
 #include <algorithm>
+#include <functional>
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/expression/comparison_expression.hpp"
+#include "duckdb/parser/expression/conjunction_expression.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 
 namespace duckdb {
+
+namespace {
+
+void FlattenConjunction(const ParsedExpression &expression, ExpressionType type,
+                        vector<const ParsedExpression *> &terms) {
+	if (expression.GetExpressionType() == type && expression.GetExpressionClass() == ExpressionClass::CONJUNCTION) {
+		for (auto &child : expression.Cast<ConjunctionExpression>().children) {
+			FlattenConjunction(*child, type, terms);
+		}
+	} else {
+		terms.push_back(&expression);
+	}
+}
+
+bool ReferencesTable(const ColumnRefExpression &column, const BaseTableRef &target, TableCatalogEntry &target_table,
+                     const BaseTableRef &other, TableCatalogEntry &other_table) {
+	if (column.column_names.size() == 1) {
+		const auto &name = column.column_names[0];
+		return target_table.ColumnExists(name) && !other_table.ColumnExists(name);
+	}
+	if (column.column_names.size() != 2) {
+		return false;
+	}
+	const auto &qualifier = column.column_names[0];
+	const auto &target_name = target.alias.empty() ? target.table_name : target.alias;
+	const auto &other_name = other.alias.empty() ? other.table_name : other.alias;
+	return StringUtil::CIEquals(qualifier, target_name) && !StringUtil::CIEquals(qualifier, other_name) &&
+	       target_table.ColumnExists(column.column_names[1]);
+}
+
+unique_ptr<ParsedExpression> ImpliedEqualityFilter(const ParsedExpression &where_clause, const BaseTableRef &target,
+                                                  TableCatalogEntry &target_table, const BaseTableRef &other,
+                                                  TableCatalogEntry &other_table) {
+	if (where_clause.GetExpressionType() != ExpressionType::CONJUNCTION_OR) {
+		return nullptr;
+	}
+	vector<const ParsedExpression *> branches;
+	FlattenConjunction(where_clause, ExpressionType::CONJUNCTION_OR, branches);
+	vector<unique_ptr<ParsedExpression>> implied;
+	string chosen_column;
+	for (auto *branch : branches) {
+		vector<const ParsedExpression *> terms;
+		FlattenConjunction(*branch, ExpressionType::CONJUNCTION_AND, terms);
+		const ParsedExpression *chosen = nullptr;
+		for (auto *term : terms) {
+			if (term->GetExpressionClass() != ExpressionClass::COMPARISON ||
+			    term->GetExpressionType() != ExpressionType::COMPARE_EQUAL) {
+				continue;
+			}
+			auto &comparison = term->Cast<ComparisonExpression>();
+			const ParsedExpression *column = nullptr;
+			if (comparison.left->GetExpressionClass() == ExpressionClass::COLUMN_REF &&
+			    comparison.right->GetExpressionClass() == ExpressionClass::CONSTANT) {
+				column = comparison.left.get();
+			} else if (comparison.right->GetExpressionClass() == ExpressionClass::COLUMN_REF &&
+			           comparison.left->GetExpressionClass() == ExpressionClass::CONSTANT) {
+				column = comparison.right.get();
+			}
+			if (!column || !ReferencesTable(column->Cast<ColumnRefExpression>(), target, target_table, other,
+			                                other_table)) {
+				continue;
+			}
+			const auto &name = column->Cast<ColumnRefExpression>().GetColumnName();
+			if (chosen_column.empty() || StringUtil::CIEquals(chosen_column, name)) {
+				chosen_column = name;
+				chosen = term;
+				break;
+			}
+		}
+		if (!chosen) {
+			return nullptr;
+		}
+		implied.push_back(chosen->Copy());
+	}
+	return make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_OR, std::move(implied));
+}
+
+} // namespace
 
 TaskPartitioner::TaskPartitioner(Connection &conn_p, QueryPlanAnalyzer &analyzer_p)
     : conn(conn_p), analyzer(analyzer_p) {
@@ -50,31 +132,108 @@ vector<DistributedPipelineTask> TaskPartitioner::ExtractPipelineTasks(LogicalOpe
 		return CreateSingleTask(base_sql);
 	}
 	auto &select = statement.node->Cast<SelectNode>();
-	if (!select.from_table || select.from_table->type != TableReferenceType::BASE_TABLE ||
-	    !select.cte_map.map.empty() || !select.modifiers.empty() || select.sample || select.from_table->sample ||
-	    !select.from_table->column_name_alias.empty()) {
+	if (!select.from_table || !select.cte_map.map.empty() || !select.modifiers.empty() || select.sample ||
+	    select.from_table->sample || !select.from_table->column_name_alias.empty()) {
 		return CreateSingleTask(base_sql);
 	}
-	auto *op = &logical_plan;
-	while (op->children.size() == 1) {
-		op = op->children[0].get();
-	}
-	if (op->type != LogicalOperatorType::LOGICAL_GET) {
+	BaseTableRef *partition_ref = nullptr;
+	QueryPlanAnalyzer::RowGroupPartitionInfo row_group_info;
+	if (select.from_table->type == TableReferenceType::BASE_TABLE) {
+		auto *op = &logical_plan;
+		while (op->children.size() == 1) {
+			op = op->children[0].get();
+		}
+		if (op->type != LogicalOperatorType::LOGICAL_GET) {
+			return CreateSingleTask(base_sql);
+		}
+		auto table = op->Cast<LogicalGet>().GetTable();
+		auto &ref = select.from_table->Cast<BaseTableRef>();
+		if (!table || !table->IsDuckTable() || ref.at_clause || !StringUtil::CIEquals(ref.table_name, table->name)) {
+			return CreateSingleTask(base_sql);
+		}
+		ref.catalog_name = table->catalog.GetName();
+		ref.schema_name = table->schema.name;
+		partition_ref = &ref;
+		row_group_info = analyzer.ExtractRowGroupInfo(op->Cast<LogicalGet>());
+	} else if (select.from_table->type == TableReferenceType::JOIN) {
+		// Every joined row belongs to exactly one row group of the selected input.
+		// Restrict this first path to two native tables and a simple inner join.
+		auto &join = select.from_table->Cast<JoinRef>();
+		if (join.type != JoinType::INNER || join.left->type != TableReferenceType::BASE_TABLE ||
+		    join.right->type != TableReferenceType::BASE_TABLE) {
+			return CreateSingleTask(base_sql);
+		}
+		auto &left = join.left->Cast<BaseTableRef>();
+		auto &right = join.right->Cast<BaseTableRef>();
+		if (left.sample || right.sample || left.at_clause || right.at_clause ||
+		    !left.column_name_alias.empty() || !right.column_name_alias.empty() ||
+		    StringUtil::CIEquals(left.table_name, right.table_name)) {
+			return CreateSingleTask(base_sql);
+		}
+		vector<LogicalGet *> scans;
+		std::function<void(LogicalOperator &)> collect = [&](LogicalOperator &op) {
+			if (op.type == LogicalOperatorType::LOGICAL_GET) {
+				scans.push_back(&op.Cast<LogicalGet>());
+			}
+			for (auto &child : op.children) {
+				collect(*child);
+			}
+		};
+		collect(logical_plan);
+		if (scans.size() != 2) {
+			return CreateSingleTask(base_sql);
+		}
+		LogicalGet *left_scan = nullptr;
+		LogicalGet *right_scan = nullptr;
+		for (auto *scan : scans) {
+			auto table = scan->GetTable();
+			if (!table || !table->IsDuckTable()) {
+				return CreateSingleTask(base_sql);
+			}
+			if (StringUtil::CIEquals(table->name, left.table_name)) {
+				left_scan = scan;
+				left.catalog_name = table->catalog.GetName();
+				left.schema_name = table->schema.name;
+			} else if (StringUtil::CIEquals(table->name, right.table_name)) {
+				right_scan = scan;
+				right.catalog_name = table->catalog.GetName();
+				right.schema_name = table->schema.name;
+			} else {
+				return CreateSingleTask(base_sql);
+			}
+		}
+		if (!left_scan || !right_scan) {
+			return CreateSingleTask(base_sql);
+		}
+		auto left_groups = analyzer.ExtractRowGroupInfo(*left_scan);
+		auto right_groups = analyzer.ExtractRowGroupInfo(*right_scan);
+		if (!left_groups.valid || !right_groups.valid) {
+			return CreateSingleTask(base_sql);
+		}
+		if (left_groups.total_row_groups >= right_groups.total_row_groups) {
+			partition_ref = &left;
+			row_group_info = std::move(left_groups);
+		} else {
+			partition_ref = &right;
+			row_group_info = std::move(right_groups);
+		}
+		if (select.where_clause) {
+			auto &dimension = partition_ref == &left ? right : left;
+			auto &fact = partition_ref == &left ? left : right;
+			auto dimension_table = (partition_ref == &left ? right_scan : left_scan)->GetTable();
+			auto fact_table = (partition_ref == &left ? left_scan : right_scan)->GetTable();
+			auto implied = ImpliedEqualityFilter(*select.where_clause, dimension, *dimension_table, fact, *fact_table);
+			if (implied) {
+				select.where_clause = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND,
+				                                                       std::move(select.where_clause), std::move(implied));
+			}
+		}
+	} else {
 		return CreateSingleTask(base_sql);
 	}
-	auto table = op->Cast<LogicalGet>().GetTable();
-	auto &table_ref = select.from_table->Cast<BaseTableRef>();
-	if (!table || !table->IsDuckTable() || !StringUtil::CIEquals(table_ref.table_name, table->name)) {
-		return CreateSingleTask(base_sql);
-	}
-	// Resolve the source on the driver so workers do not depend on their default catalog.
-	table_ref.catalog_name = table->catalog.GetName();
-	table_ref.schema_name = table->schema.name;
 	const string task_sql = statement.ToString();
 
-	// Extract row group information for DuckDB-aligned partitioning
 	// If reliable rowid bounds are unavailable, delegate instead of using modulo-based partitioning.
-	auto row_group_info = analyzer.ExtractRowGroupInfo(logical_plan);
 	if (!row_group_info.valid || row_group_info.total_row_groups == 0) {
 		return CreateSingleTask(task_sql);
 	}
@@ -84,8 +243,9 @@ vector<DistributedPipelineTask> TaskPartitioner::ExtractPipelineTasks(LogicalOpe
 	const idx_t num_tasks = std::min(num_workers, row_group_info.total_row_groups);
 	const idx_t groups_per_task = row_group_info.total_row_groups / num_tasks;
 	const idx_t remainder = row_group_info.total_row_groups % num_tasks;
-	const string rowid =
-	    ColumnRefExpression("rowid", table_ref.alias.empty() ? table_ref.table_name : table_ref.alias).ToString();
+	const string rowid = ColumnRefExpression(
+	                         "rowid", partition_ref->alias.empty() ? partition_ref->table_name : partition_ref->alias)
+	                         .ToString();
 	vector<DistributedPipelineTask> tasks;
 	tasks.reserve(num_tasks);
 	for (idx_t task_idx = 0; task_idx < num_tasks; ++task_idx) {

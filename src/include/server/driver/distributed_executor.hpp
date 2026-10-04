@@ -73,7 +73,7 @@ public:
 
 	// Execute a query in distributed manner.
 	// Returns result with nullptr if query cannot be distributed, which will fall back to local execution.
-	DistributedExecutionResult ExecuteDistributed(const string &sql);
+	DistributedExecutionResult ExecuteDistributed(const string &sql, bool require_partitioned_join = false);
 
 private:
 	WorkerManager &worker_manager;
