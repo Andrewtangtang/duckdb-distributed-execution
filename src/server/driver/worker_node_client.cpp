@@ -1,5 +1,9 @@
 #include "server/driver/worker_node_client.hpp"
 
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+
 namespace duckdb {
 
 WorkerNodeClient::WorkerNodeClient(const string &location_p) : location(std::move(location_p)) {
@@ -14,41 +18,24 @@ arrow::Status WorkerNodeClient::Connect() {
 
 arrow::Status WorkerNodeClient::ExecutePartition(const distributed::ExecutePartitionRequest &request,
                                                  arrow::RecordBatchVector &batches) {
+	const auto start = std::chrono::steady_clock::now();
 	distributed::DistributedRequest req;
 	*req.mutable_execute_partition() = request;
 
 	std::string req_data = req.SerializeAsString();
-	arrow::flight::Action action {"execute_partition", arrow::Buffer::FromString(req_data)};
-
-	auto action_result = client->DoAction(action);
-	if (!action_result.ok()) {
-		return action_result.status();
-	}
-	auto result_stream = std::move(action_result).ValueOrDie();
-
-	auto next_result = result_stream->Next();
-	if (!next_result.ok()) {
-		return next_result.status();
-	}
-	auto result = std::move(next_result).ValueOrDie();
-	if (!result) {
-		return arrow::Status::Invalid("No response from worker");
-	}
-
-	distributed::DistributedResponse response;
-	if (!response.ParseFromArray(result->body->data(), result->body->size())) {
-		return arrow::Status::Invalid("Failed to parse response");
-	}
-
-	if (!response.success()) {
-		return arrow::Status::Invalid("Worker execution failed: " + response.error_message());
-	}
-
-	// Now get the actual data stream using DoGet with the request as ticket.
+	// DoGet executes the partition and propagates worker errors. The previous DoAction only acknowledged the request.
 	arrow::flight::Ticket ticket;
 	ticket.ticket = req_data;
 	ARROW_ASSIGN_OR_RAISE(auto stream, client->DoGet(ticket));
+	const auto get_end = std::chrono::steady_clock::now();
 	ARROW_ASSIGN_OR_RAISE(batches, stream->ToRecordBatches());
+	if (std::getenv("DUCKHERDER_PROFILE_DISTRIBUTED")) {
+		const auto end = std::chrono::steady_clock::now();
+		auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+		std::fprintf(stderr, "PROFILE rpc task=%llu get=%.3f fetch=%.3f total=%.3f ms\n",
+		             static_cast<unsigned long long>(request.partition_id()), ms(start, get_end), ms(get_end, end),
+		             ms(start, end));
+	}
 	return arrow::Status::OK();
 }
 

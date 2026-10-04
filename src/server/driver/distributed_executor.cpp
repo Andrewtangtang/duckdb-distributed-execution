@@ -10,6 +10,7 @@
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/logical_operator.hpp"
@@ -23,8 +24,20 @@
 #include "server/driver/worker_manager.hpp"
 
 #include <future>
+#include <cstdio>
+#include <cstdlib>
 
 namespace duckdb {
+
+namespace {
+
+using ProfileClock = std::chrono::steady_clock;
+
+double ProfileMs(ProfileClock::time_point start, ProfileClock::time_point end) {
+	return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+} // namespace
 
 DistributedExecutor::DistributedExecutor(WorkerManager &worker_manager_p, Connection &conn_p,
                                          distributed::StorageConfig storage_config_p)
@@ -51,12 +64,12 @@ DistributedExecutor::DistributedExecutor(WorkerManager &worker_manager_p, Connec
 // 3. Each worker executes its partition (LocalState semantics) [WORKER]
 // 4. Driver collects and combines results (GlobalState semantics) [Driver]
 // 5. Final result is returned to client [Driver]
-DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string &sql) {
+DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string &sql, bool require_partitioned_join) {
 	DistributedExecutionResult exec_result;
 	auto &db_instance = *conn.context->db;
 
 	// Start timing worker execution
-	auto worker_start = std::chrono::high_resolution_clock::now();
+	auto profile_start = ProfileClock::now();
 
 	// Which operators can be distributed is checked on the plan.
 	Parser parser;
@@ -70,6 +83,12 @@ DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string 
 		return exec_result;
 	}
 	const auto &statement = parser.statements[0]->Cast<SelectStatement>();
+	if (require_partitioned_join &&
+	    (!statement.named_param_map.empty() || statement.node->type != QueryNodeType::SELECT_NODE ||
+	     !statement.node->Cast<SelectNode>().from_table ||
+	     statement.node->Cast<SelectNode>().from_table->type != TableReferenceType::JOIN)) {
+		return exec_result;
+	}
 
 	auto workers = worker_manager.GetAvailableWorkers();
 	if (workers.empty()) {
@@ -90,8 +109,12 @@ DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string 
 
 	// Analyze query to determine merge strategy
 	QueryPlanAnalyzer::QueryAnalysis query_analysis = plan_analyzer->AnalyzeQuery(*logical_plan, statement);
+	auto profile_plan = ProfileClock::now();
 	const bool partitioned_aggregation = query_analysis.supports_partitioned_aggregation &&
 	                                     storage_config.storage_case() != distributed::StorageConfig::STORAGE_NOT_SET;
+	if (require_partitioned_join && !partitioned_aggregation) {
+		return exec_result;
+	}
 	// The partial query scans the same table with the same filters, so it is partitioned with the original plan.
 	const string &execution_sql = partitioned_aggregation ? query_analysis.partial_sql : sql;
 
@@ -102,6 +125,10 @@ DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string 
 	if (tasks.empty()) {
 		return exec_result;
 	}
+	if (require_partitioned_join && tasks.size() < 2) {
+		return exec_result;
+	}
+	auto profile_partition = ProfileClock::now();
 
 	// A delegated query already contains its final result, including aggregates.
 	if (tasks.size() == 1 && !partitioned_aggregation) {
@@ -149,6 +176,7 @@ DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string 
 	for (const auto &type : partial_types) {
 		serialized_types.emplace_back(PlanSerializer::SerializeLogicalType(type));
 	}
+	auto profile_prepare = ProfileClock::now();
 
 	// Phase 4: Distribute tasks to workers。
 	vector<distributed::ExecutePartitionRequest> requests(tasks.size());
@@ -166,6 +194,7 @@ DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string 
 			req.add_column_types(type_bytes);
 		}
 	}
+	auto profile_requests = ProfileClock::now();
 
 	vector<arrow::RecordBatchVector> task_batches(tasks.size());
 	vector<arrow::Status> task_statuses(tasks.size());
@@ -189,6 +218,7 @@ DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string 
 	for (auto &dispatch : dispatches) {
 		dispatch.get();
 	}
+	auto profile_dispatch = ProfileClock::now();
 
 	for (idx_t worker_id = 0; worker_id < workers.size(); ++worker_id) {
 		for (auto task_idx : worker_to_tasks[worker_id]) {
@@ -210,6 +240,15 @@ DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string 
 	if (partitioned_aggregation) {
 		exec_result.result = result_merger->MergePartialAggregates(task_batches, partial_names, partial_types, names,
 		                                                           types, query_analysis.final_sql);
+		if (std::getenv("DUCKHERDER_PROFILE_DISTRIBUTED")) {
+			auto end = ProfileClock::now();
+			std::fprintf(stderr,
+			             "PROFILE driver plan=%.3f partition=%.3f prepare=%.3f requests=%.3f dispatch=%.3f merge=%.3f total=%.3f ms\n",
+			             ProfileMs(profile_start, profile_plan), ProfileMs(profile_plan, profile_partition),
+			             ProfileMs(profile_partition, profile_prepare), ProfileMs(profile_prepare, profile_requests),
+			             ProfileMs(profile_requests, profile_dispatch), ProfileMs(profile_dispatch, end),
+			             ProfileMs(profile_start, end));
+		}
 		return exec_result;
 	}
 	std::shared_ptr<arrow::Schema> schema;

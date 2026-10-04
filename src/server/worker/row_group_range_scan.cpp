@@ -8,6 +8,9 @@
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 
+#include <cstdio>
+#include <cstdlib>
+
 namespace duckdb {
 
 namespace {
@@ -70,6 +73,10 @@ unique_ptr<GlobalTableFunctionState> RowGroupRangeScanInitGlobal(ClientContext &
 		++result->max_threads;
 	}
 	scan_state.max_row = MinValue(scan_state.max_row, max_row);
+	if (std::getenv("DUCKHERDER_PROFILE_DISTRIBUTED")) {
+		std::fprintf(stderr, "PROFILE rowgroup table=%s groups=%llu\n", table.name.c_str(),
+		             static_cast<unsigned long long>(result->max_threads));
+	}
 
 	if (input.CanRemoveFilterColumns()) {
 		result->projection_ids = input.projection_ids;

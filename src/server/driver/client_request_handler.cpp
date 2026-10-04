@@ -7,6 +7,7 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/prepared_statement.hpp"
 #include "query_common.hpp"
+#include "server/driver/distributed_executor.hpp"
 #include "server/driver/query_history.hpp"
 #include "server/driver/query_utils.hpp"
 #include "server/driver/worker_fragment_pushdown.hpp"
@@ -248,9 +249,24 @@ arrow::Status ClientRequestHandler::ScanTable(const distributed::ScanTableReques
 	auto query_start = std::chrono::steady_clock::now();                // For duration calculation
 	query_info.execution_start_time = std::chrono::system_clock::now(); // Wall-clock timestamp
 
-	// The driver plans the query, running its single-table fragments on workers when possible.
-	vector<Value> parameters;
-	auto result = prepared->Execute(parameters, /*allow_stream_result=*/false);
+	// A two-table partial aggregate can run its join on each worker with one input partitioned.
+	// Other queries retain the optimizer's fragment path and local fallback.
+	DistributedExecutionResult distributed;
+	if (registration.distributed_executor && registration.connection->context->transaction.IsAutoCommit()) {
+		distributed = registration.distributed_executor->ExecuteDistributed(sql, /*require_partitioned_join=*/true);
+	}
+	const bool ran_distributed = distributed.result != nullptr || distributed.arrow_schema != nullptr;
+	unique_ptr<QueryResult> result;
+	if (ran_distributed) {
+		result = std::move(distributed.result);
+		query_info.execution_mode = QueryExecutionMode::ROW_GROUP_PARTITION;
+		query_info.merge_strategy = distributed.merge_strategy;
+		query_info.num_workers_used = distributed.num_workers_used;
+		query_info.num_tasks_generated = distributed.num_tasks;
+	} else {
+		vector<Value> parameters;
+		result = prepared->Execute(parameters, /*allow_stream_result=*/false);
+	}
 
 	// Calculate total query duration (using steady_clock for accurate elapsed time)
 	auto query_end = std::chrono::steady_clock::now();
@@ -262,6 +278,11 @@ arrow::Status ClientRequestHandler::ScanTable(const distributed::ScanTableReques
 		}
 	}
 	query_history.Record(std::move(query_info));
+	if (distributed.arrow_schema) {
+		schema = std::move(distributed.arrow_schema);
+		batches = std::move(distributed.arrow_batches);
+		return arrow::Status::OK();
+	}
 
 	if (result->HasError()) {
 		return arrow::Status::Invalid("Query error: " + result->GetError());
