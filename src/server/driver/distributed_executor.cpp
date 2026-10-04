@@ -14,6 +14,7 @@
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
@@ -114,11 +115,22 @@ DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string 
 		return exec_result;
 	}
 	const auto &statement = parser.statements[0]->Cast<SelectStatement>();
-	if (require_partitioned_join &&
-	    (!statement.named_param_map.empty() || statement.node->type != QueryNodeType::SELECT_NODE ||
-	     !statement.node->Cast<SelectNode>().from_table ||
-	     statement.node->Cast<SelectNode>().from_table->type != TableReferenceType::JOIN)) {
-		return exec_result;
+	if (require_partitioned_join) {
+		// Reject unsupported joins before ExtractPlan: planning a second time can fail for complex
+		// queries even when their already-prepared local plan is executable (e.g. TPC-H Q2).
+		if (!statement.named_param_map.empty() || statement.node->type != QueryNodeType::SELECT_NODE) {
+			return exec_result;
+		}
+		const auto &select = statement.node->Cast<SelectNode>();
+		if (!select.from_table || select.from_table->type != TableReferenceType::JOIN ||
+		    !select.cte_map.map.empty() || !select.modifiers.empty() || select.sample) {
+			return exec_result;
+		}
+		const auto &join = select.from_table->Cast<JoinRef>();
+		if (join.type != JoinType::INNER || join.left->type != TableReferenceType::BASE_TABLE ||
+		    join.right->type != TableReferenceType::BASE_TABLE) {
+			return exec_result;
+		}
 	}
 
 	auto workers = worker_manager.GetAvailableWorkers();
