@@ -1,6 +1,14 @@
 # Q19 join partition experiment (local ObjFS)
 
-Branch: `experiment/partitioned-join-q19`. The driver partitions the larger native table of a two-table inner join by row group. Each worker runs the full join against the other table and returns a partial aggregate; the driver merges the partial values. The path is limited to queries supported by the existing partial aggregate rewriter and runs only in autocommit mode. Unsupported plans retain local execution.
+Prototype branch: `experiment/partitioned-join-q19`; follow-up branch: `experiment/two-table-join`. The driver partitions the larger native table of a two-table inner join by row group. Each worker runs the full join against the other table and returns a partial aggregate; the driver merges the partial values. The path is limited to queries supported by the existing partial aggregate rewriter and runs only in autocommit mode. Unsupported plans retain local execution.
+
+## Follow-up branch validation
+
+The follow-up branch combines the Join path with async worker dispatch and requires an actual inner equality Join plus matching native table catalog/schema before partitioning. Local and MSI builds include `latency_injection_fs`. All 40 Duckherder unit and Flight tests passed (975 assertions). The Join tests include repeated keys, NULLs, deleted rowid gaps, grouped `COUNT`/`SUM`/`AVG`, and non-equality Join fallback.
+
+On MSI, commit `5e99f77`, SF10 Q19, three cold repetitions, S3 latency injection, a 2 CPU driver, and three 2 CPU workers all passed result verification. The per-run seconds were `48.384, 48.795, 48.332` with 0 workers and `17.272, 17.506, 17.667` with 3 workers: medians 48.384 and 17.506 seconds (2.76×). Results: `benchmark/tpch/results/20261005-142628-sf10` on MSI. A representative driver profile spent 17,660 ms dispatching and waiting, versus 0.6 ms planning, 1.5 ms partitioning, 1.1 ms preparing, and 1.0 ms merging.
+
+On local ObjFS SF10 data, the same branch returned `30104438.0911` in every run. After the first run, the original SQL took 110–133 ms with 0 workers and 79–103 ms with 3 workers. Local DuckDB with the same safe `p_brand` prefilter took 61–66 ms. Thus the prefilter accounts for a substantial part of the apparent local speedup; a low-latency cost policy should compare against an equally optimized local plan. Killing one registered worker before Q19 produced the same answer with query history reporting `LOCAL` and 0 workers.
 
 ## Setup and measurement
 
