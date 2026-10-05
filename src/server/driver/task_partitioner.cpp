@@ -18,11 +18,42 @@
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
+#include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 
 namespace duckdb {
 
 namespace {
+
+bool HasEquiJoin(const LogicalOperator &op) {
+	if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		const auto &join = op.Cast<LogicalComparisonJoin>();
+		for (const auto &condition : join.conditions) {
+			if (condition.comparison == ExpressionType::COMPARE_EQUAL) {
+				return true;
+			}
+		}
+	}
+	for (const auto &child : op.children) {
+		if (HasEquiJoin(*child)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool MatchesRef(const BaseTableRef &ref, const TableCatalogEntry &table) {
+	if (!StringUtil::CIEquals(ref.table_name, table.name)) {
+		return false;
+	}
+	if (!ref.catalog_name.empty()) {
+		return StringUtil::CIEquals(ref.catalog_name, table.catalog.GetName()) &&
+		       (ref.schema_name.empty() || StringUtil::CIEquals(ref.schema_name, table.schema.name));
+	}
+	// DuckDB resolves a two-part name as either schema.table or catalog.table.
+	return ref.schema_name.empty() || StringUtil::CIEquals(ref.schema_name, table.schema.name) ||
+	       StringUtil::CIEquals(ref.schema_name, table.catalog.GetName());
+}
 
 void FlattenConjunction(const ParsedExpression &expression, ExpressionType type,
                         vector<const ParsedExpression *> &terms) {
@@ -148,7 +179,7 @@ vector<DistributedPipelineTask> TaskPartitioner::ExtractPipelineTasks(LogicalOpe
 		}
 		auto table = op->Cast<LogicalGet>().GetTable();
 		auto &ref = select.from_table->Cast<BaseTableRef>();
-		if (!table || !table->IsDuckTable() || ref.at_clause || !StringUtil::CIEquals(ref.table_name, table->name)) {
+		if (!table || !table->IsDuckTable() || ref.at_clause || !MatchesRef(ref, *table)) {
 			return CreateSingleTask(base_sql);
 		}
 		ref.catalog_name = table->catalog.GetName();
@@ -159,7 +190,8 @@ vector<DistributedPipelineTask> TaskPartitioner::ExtractPipelineTasks(LogicalOpe
 		// Every joined row belongs to exactly one row group of the selected input.
 		// Restrict this first path to two native tables and a simple inner join.
 		auto &join = select.from_table->Cast<JoinRef>();
-		if (join.type != JoinType::INNER || join.left->type != TableReferenceType::BASE_TABLE ||
+		if (join.type != JoinType::INNER || !HasEquiJoin(logical_plan) ||
+		    join.left->type != TableReferenceType::BASE_TABLE ||
 		    join.right->type != TableReferenceType::BASE_TABLE) {
 			return CreateSingleTask(base_sql);
 		}
@@ -190,11 +222,17 @@ vector<DistributedPipelineTask> TaskPartitioner::ExtractPipelineTasks(LogicalOpe
 			if (!table || !table->IsDuckTable()) {
 				return CreateSingleTask(base_sql);
 			}
-			if (StringUtil::CIEquals(table->name, left.table_name)) {
+			if (MatchesRef(left, *table)) {
+				if (left_scan) {
+					return CreateSingleTask(base_sql);
+				}
 				left_scan = scan;
 				left.catalog_name = table->catalog.GetName();
 				left.schema_name = table->schema.name;
-			} else if (StringUtil::CIEquals(table->name, right.table_name)) {
+			} else if (MatchesRef(right, *table)) {
+				if (right_scan) {
+					return CreateSingleTask(base_sql);
+				}
 				right_scan = scan;
 				right.catalog_name = table->catalog.GetName();
 				right.schema_name = table->schema.name;

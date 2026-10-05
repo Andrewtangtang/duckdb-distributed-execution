@@ -200,6 +200,8 @@ TEST_CASE("Two-table inner join partitions one input and merges partial sums", "
 	REQUIRE_FALSE(con.Query("CREATE TABLE dim AS SELECT i AS key, i + 1 AS multiplier, "
 	                        "CASE WHEN i % 3 = 0 THEN 'A' ELSE 'B' END AS brand FROM range(17) t(i)")
 	                  ->HasError());
+	REQUIRE_FALSE(con.Query("INSERT INTO dim VALUES (3, 11, 'B'), (NULL, 9, 'A')")->HasError());
+	REQUIRE_FALSE(con.Query("INSERT INTO fact VALUES (250001, NULL, 5, true), (250002, 3, NULL, true)")->HasError());
 	REQUIRE_FALSE(con.Query("DELETE FROM fact WHERE id >= 10000 AND id < 20000")->HasError());
 	QueryPlanAnalyzer analyzer(con);
 	TaskPartitioner partitioner(con, analyzer);
@@ -210,7 +212,9 @@ TEST_CASE("Two-table inner join partitions one input and merges partial sums", "
 	         "WHERE (f.key = d.key AND d.brand = 'A' AND f.keep) OR "
 	         "(f.key = d.key AND d.brand = 'B' AND f.id % 5 = 0)",
 	         "SELECT sum(f.amount * d.multiplier) AS revenue FROM fact f, dim d "
-	         "WHERE (f.key = d.key AND f.keep) OR (f.key = d.key AND d.brand = 'B' AND f.id % 5 = 0)"}) {
+	         "WHERE (f.key = d.key AND f.keep) OR (f.key = d.key AND d.brand = 'B' AND f.id % 5 = 0)",
+	         "SELECT d.brand, count(*), sum(f.amount), avg(f.amount) FROM fact f "
+	         "JOIN dim d ON f.key = d.key GROUP BY 1"}) {
 		INFO(sql);
 		auto plan = con.ExtractPlan(sql);
 		REQUIRE(plan != nullptr);
@@ -228,18 +232,29 @@ TEST_CASE("Two-table inner join partitions one input and merges partial sums", "
 			                                           task.task_sql))
 			                  ->HasError());
 		}
-		auto expected = con.Query(sql);
-		auto actual = con.Query(analysis.final_sql);
+		auto expected = con.Query(StringUtil::Format("SELECT * FROM (%s) ORDER BY ALL", sql));
+		auto actual = con.Query(StringUtil::Format("SELECT * FROM (%s) ORDER BY ALL", analysis.final_sql));
 		REQUIRE_FALSE(expected->HasError());
 		REQUIRE_FALSE(actual->HasError());
-		REQUIRE(Value::NotDistinctFrom(actual->GetValue(0, 0).DefaultCastAs(expected->types[0]),
-		                               expected->GetValue(0, 0)));
+		REQUIRE(actual->RowCount() == expected->RowCount());
+		for (idx_t row = 0; row < expected->RowCount(); ++row) {
+			for (idx_t col = 0; col < expected->ColumnCount(); ++col) {
+				REQUIRE(Value::NotDistinctFrom(actual->GetValue(col, row).DefaultCastAs(expected->types[col]),
+					                               expected->GetValue(col, row)));
+			}
+		}
 	}
 
 	const string outer_sql = "SELECT sum(f.amount) FROM fact f LEFT JOIN dim d ON f.key = d.key";
 	auto plan = con.ExtractPlan(outer_sql);
 	REQUIRE(plan != nullptr);
 	REQUIRE_FALSE(IsSupportedPlan(*plan));
+	for (const auto &sql : {"SELECT sum(f.amount) FROM fact f JOIN dim d ON f.key < d.key",
+	                        "SELECT sum(f.amount) FROM fact f CROSS JOIN dim d"}) {
+		plan = con.ExtractPlan(sql);
+		REQUIRE(plan != nullptr);
+		REQUIRE(partitioner.ExtractPipelineTasks(*plan, sql, 3).size() == 1);
+	}
 }
 
 TEST_CASE("Partial aggregate SQL preserves global aggregate semantics", "[partial_aggregate]") {
