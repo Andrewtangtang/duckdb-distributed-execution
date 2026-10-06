@@ -15,8 +15,9 @@
 #include "duckdb/main/chunk_scan_state/query_result.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
-#include "duckdb/planner/logical_operator.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/statement/logical_plan_statement.hpp"
+#include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/storage/storage_info.hpp"
 #include "server/object_storage_database.hpp"
 #include "server/startup_sql.hpp"
@@ -27,11 +28,14 @@
 #include <arrow/array.h>
 #include <arrow/c/bridge.h>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 
 namespace duckdb {
 
-WorkerNode::WorkerNode(string worker_id_p, string host_p, int port_p)
-    : worker_id(std::move(worker_id_p)), host(std::move(host_p)), port(port_p) {
+WorkerNode::WorkerNode(string worker_id_p, string host_p, int port_p, idx_t threads_per_worker_p)
+    : worker_id(std::move(worker_id_p)), host(std::move(host_p)), port(port_p),
+      threads_per_worker(threads_per_worker_p) {
 	db = make_uniq<DuckDB>(/*path=*/nullptr, /*config=*/nullptr);
 	// Workers need core functions when created from a loadable extension.
 	db->LoadStaticExtension<CoreFunctionsExtension>();
@@ -147,6 +151,19 @@ arrow::Status WorkerNode::ExecutePipelineTask(const distributed::ExecutePartitio
 
 	// Execute task using SQL-based execution.
 	if (!result && !req.sql().empty()) {
+		if (const auto *profile_dir = std::getenv("DUCKHERDER_WORKER_PROFILE_DIR")) {
+			const auto output = StringUtil::Format("%s/%s_%llu.json", profile_dir, worker_id,
+			                                       static_cast<unsigned long long>(req.partition_id()));
+			auto setting_result = task_conn.Query("SET enable_profiling = 'json'");
+			if (setting_result->HasError()) {
+				return arrow::Status::Invalid(setting_result->GetError());
+			}
+			setting_result =
+			    task_conn.Query(StringUtil::Format("SET profiling_output = %s", KeywordHelper::WriteQuoted(output)));
+			if (setting_result->HasError()) {
+				return arrow::Status::Invalid(setting_result->GetError());
+			}
+		}
 		// Stream the result so it is converted to Arrow as it is produced instead of being materialized first.
 		result = task_conn.SendQuery(req.sql());
 	}
@@ -165,17 +182,21 @@ arrow::Status WorkerNode::ExecutePipelineTask(const distributed::ExecutePartitio
 arrow::Status WorkerNode::HandleExecutePartition(const distributed::ExecutePartitionRequest &req,
                                                  distributed::DistributedResponse &resp,
                                                  std::shared_ptr<arrow::RecordBatchReader> &reader) {
+	const auto start = std::chrono::steady_clock::now();
 	// Object storage tasks run on their own session of this worker's instance for that database.
 	ARROW_RETURN_NOT_OK(ValidateRequest(req.storage_config()));
 	if (req.storage_config().storage_case() == distributed::StorageConfig::kInMemory) {
 		return arrow::Status::Invalid("Workers cannot execute on control-node in-memory object storage");
 	}
 	ARROW_ASSIGN_OR_RAISE(auto object_storage_database, GetOrOpenObjectStorageDatabase(req.storage_config()));
+	const auto database_end = std::chrono::steady_clock::now();
 	ARROW_ASSIGN_OR_RAISE(auto task_conn, object_storage_database->Connect());
+	const auto connection_end = std::chrono::steady_clock::now();
 
 	// Execute the pipeline task with state tracking
 	unique_ptr<QueryResult> result;
 	auto exec_status = ExecutePipelineTask(req, *task_conn, result);
+	const auto query_end = std::chrono::steady_clock::now();
 
 	if (!exec_status.ok()) {
 		resp.set_success(false);
@@ -190,6 +211,18 @@ arrow::Status WorkerNode::HandleExecutePartition(const distributed::ExecuteParti
 	auto status = QueryResultToArrowReader(*result, *task_conn->context, reader, &row_count);
 	if (!status.ok()) {
 		return status;
+	}
+	if (std::getenv("DUCKHERDER_PROFILE_DISTRIBUTED")) {
+		const auto end = std::chrono::steady_clock::now();
+		auto ms = [](auto a, auto b) {
+			return std::chrono::duration<double, std::milli>(b - a).count();
+		};
+		std::fprintf(stderr,
+		             "PROFILE worker=%s task=%llu database=%.3f connection=%.3f query=%.3f "
+		             "arrow=%.3f total=%.3f ms\n",
+		             worker_id.c_str(), static_cast<unsigned long long>(req.partition_id()), ms(start, database_end),
+		             ms(database_end, connection_end), ms(connection_end, query_end), ms(query_end, end),
+		             ms(start, end));
 	}
 
 	resp.set_success(true);
@@ -293,6 +326,13 @@ WorkerNode::GetOrOpenObjectStorageDatabase(const distributed::StorageConfig &con
 			                              database_result.status().message());
 		}
 		instance = std::move(database_result).ValueOrDie();
+		if (threads_per_worker) {
+			ARROW_ASSIGN_OR_RAISE(auto settings_conn, instance->Connect());
+			auto result = settings_conn->Query(StringUtil::Format("SET GLOBAL threads = %llu", threads_per_worker));
+			if (result->HasError()) {
+				return arrow::Status::Invalid(result->GetError());
+			}
+		}
 		OptimizerExtension::Register(DBConfig::GetConfig(*instance->GetInstance().instance),
 		                             GetRowGroupRangeScanExtension());
 		DUCKDB_LOG_DEBUG(*instance->GetInstance().instance,

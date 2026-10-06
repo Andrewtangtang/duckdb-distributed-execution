@@ -5,6 +5,7 @@
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/logical_operator.hpp"
+#include "duckdb/planner/operator/logical_comparison_join.hpp"
 
 namespace duckdb {
 
@@ -44,6 +45,13 @@ bool IsSupportedPlan(LogicalOperator &op) {
 	}
 	case LogicalOperatorType::LOGICAL_GET:
 		return true;
+	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+		if (op.Cast<LogicalComparisonJoin>().join_type != JoinType::INNER || op.children.size() != 2) {
+			return false;
+		}
+		return IsSupportedPlan(*op.children[0]) && IsSupportedPlan(*op.children[1]);
+	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
+		return op.children.size() == 2 && IsSupportedPlan(*op.children[0]) && IsSupportedPlan(*op.children[1]);
 	default:
 		return false;
 	}
