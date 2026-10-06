@@ -9,8 +9,7 @@
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
-#include "duckdb/parallel/pipeline.hpp"
-#include "duckdb/parallel/task_executor.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
@@ -24,41 +23,9 @@
 #include "server/driver/query_utils.hpp"
 #include "server/driver/worker_manager.hpp"
 
+#include <arrow/util/future.h>
+
 namespace duckdb {
-
-namespace {
-
-class WorkerDispatchTask : public BaseExecutorTask {
-public:
-	WorkerDispatchTask(TaskExecutor &executor, WorkerNodeClient &client_p, const vector<idx_t> &task_indices_p,
-	                   const vector<distributed::ExecutePartitionRequest> &requests_p,
-	                   vector<arrow::RecordBatchVector> &task_batches_p, vector<arrow::Status> &task_statuses_p)
-	    : BaseExecutorTask(executor), client(client_p), task_indices(task_indices_p), requests(requests_p),
-	      task_batches(task_batches_p), task_statuses(task_statuses_p) {
-	}
-
-	void ExecuteTask() override {
-		for (auto task_idx : task_indices) {
-			task_statuses[task_idx] = client.ExecutePartition(requests[task_idx], task_batches[task_idx]);
-			if (!task_statuses[task_idx].ok()) {
-				return;
-			}
-		}
-	}
-
-	string TaskType() const override {
-		return "WorkerDispatchTask";
-	}
-
-private:
-	WorkerNodeClient &client;
-	const vector<idx_t> &task_indices;
-	const vector<distributed::ExecutePartitionRequest> &requests;
-	vector<arrow::RecordBatchVector> &task_batches;
-	vector<arrow::Status> &task_statuses;
-};
-
-} // namespace
 
 DistributedExecutor::DistributedExecutor(WorkerManager &worker_manager_p, Connection &conn_p,
                                          distributed::StorageConfig storage_config_p)
@@ -203,15 +170,53 @@ DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string 
 
 	vector<arrow::RecordBatchVector> task_batches(tasks.size());
 	vector<arrow::Status> task_statuses(tasks.size());
-	TaskExecutor executor(*conn.context);
+	Value thread_setting;
+	if (!db_instance.TryGetCurrentSetting("duckherder_async_threads", thread_setting)) {
+		throw InternalException("Duckherder async thread setting is not registered");
+	}
+	auto thread_count = thread_setting.GetValue<int64_t>();
+	if (thread_count == 0) {
+		const auto cpu_threads = TaskScheduler::GetScheduler(*conn.context).NumberOfThreads();
+		thread_count = MinValue<idx_t>(cpu_threads, 64) * 4;
+	}
+	auto pool_result = worker_manager.GetDispatchPool(NumericCast<int>(thread_count));
+	if (!pool_result.ok()) {
+		throw IOException("Failed creating worker dispatch pool: %s", pool_result.status().ToString());
+	}
+	auto pool = *pool_result;
+	vector<arrow::Future<>> dispatches;
+	arrow::Status dispatch_error = arrow::Status::OK();
+	dispatches.reserve(workers.size());
 	for (idx_t worker_id = 0; worker_id < workers.size(); ++worker_id) {
 		if (worker_to_tasks[worker_id].empty()) {
 			continue;
 		}
-		executor.ScheduleTask(make_uniq<WorkerDispatchTask>(
-		    executor, *workers[worker_id]->client, worker_to_tasks[worker_id], requests, task_batches, task_statuses));
+		// Flight calls block while the worker runs; keep their waits outside DuckDB's CPU-sized task pool.
+		auto submitted = pool->Submit([&, worker_id]() -> arrow::Status {
+			for (auto task_idx : worker_to_tasks[worker_id]) {
+				task_statuses[task_idx] =
+				    workers[worker_id]->client->ExecutePartition(requests[task_idx], task_batches[task_idx]);
+				if (!task_statuses[task_idx].ok()) {
+					return arrow::Status::OK();
+				}
+			}
+			return arrow::Status::OK();
+		});
+		if (!submitted.ok()) {
+			dispatch_error = submitted.status();
+			break;
+		}
+		dispatches.emplace_back(*submitted);
 	}
-	executor.WorkOnTasks();
+	for (auto &dispatch : dispatches) {
+		const auto &status = dispatch.status();
+		if (!status.ok() && dispatch_error.ok()) {
+			dispatch_error = status;
+		}
+	}
+	if (!dispatch_error.ok()) {
+		throw IOException("Worker dispatch failed: %s", dispatch_error.ToString());
+	}
 
 	for (idx_t worker_id = 0; worker_id < workers.size(); ++worker_id) {
 		for (auto task_idx : worker_to_tasks[worker_id]) {
