@@ -90,19 +90,10 @@ bool BuildPartialAggregation(const SelectStatement &original, QueryPlanAnalyzer:
 QueryPlanAnalyzer::QueryPlanAnalyzer(Connection &conn_p) : conn(conn_p) {
 }
 
-QueryPlanAnalyzer::RowGroupPartitionInfo QueryPlanAnalyzer::ExtractRowGroupInfo(LogicalOperator &logical_plan) {
+QueryPlanAnalyzer::RowGroupPartitionInfo QueryPlanAnalyzer::ExtractRowGroupInfo(LogicalGet &get) {
 	RowGroupPartitionInfo row_group_info;
-
 	conn.context->RunFunctionInTransaction([&]() {
-		// Find the native table scan instead of generating a physical plan to estimate row groups.
-		auto *op = &logical_plan;
-		while (op->children.size() == 1) {
-			op = op->children[0].get();
-		}
-		if (op->type != LogicalOperatorType::LOGICAL_GET) {
-			return;
-		}
-		auto table = op->Cast<LogicalGet>().GetTable();
+		auto table = get.GetTable();
 		if (!table || !table->IsDuckTable() || table->ColumnExists("rowid")) {
 			return;
 		}

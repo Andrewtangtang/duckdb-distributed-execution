@@ -35,6 +35,15 @@ DistributedExecutor::DistributedExecutor(WorkerManager &worker_manager_p, Connec
 	task_partitioner = make_uniq<TaskPartitioner>(conn, *plan_analyzer);
 }
 
+bool DistributedExecutor::CanPartitionJoin(LogicalOperator &plan, const SelectStatement &statement,
+                                           string &qualified_sql, QueryPlanAnalyzer::QueryAnalysis &analysis) {
+	if (storage_config.storage_case() == distributed::StorageConfig::STORAGE_NOT_SET ||
+	    worker_manager.GetAvailableWorkers().size() < 2 || !IsSupportedPlan(plan)) {
+		return false;
+	}
+	return task_partitioner->CanPartitionJoin(plan, statement, qualified_sql, analysis);
+}
+
 // Distributed execution Driver implementing DuckDB's parallel execution model.
 //
 // Architecture mapping (thread-based -> node-based):
@@ -52,12 +61,11 @@ DistributedExecutor::DistributedExecutor(WorkerManager &worker_manager_p, Connec
 // 3. Each worker executes its partition (LocalState semantics) [WORKER]
 // 4. Driver collects and combines results (GlobalState semantics) [Driver]
 // 5. Final result is returned to client [Driver]
-DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string &sql) {
+DistributedExecutionResult
+DistributedExecutor::ExecuteDistributed(const string &sql, DistributedFragmentKind kind,
+                                        const QueryPlanAnalyzer::QueryAnalysis *join_analysis) {
 	DistributedExecutionResult exec_result;
 	auto &db_instance = *conn.context->db;
-
-	// Start timing worker execution
-	auto worker_start = std::chrono::high_resolution_clock::now();
 
 	// Which operators can be distributed is checked on the plan.
 	Parser parser;
@@ -71,6 +79,9 @@ DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string 
 		return exec_result;
 	}
 	const auto &statement = parser.statements[0]->Cast<SelectStatement>();
+	if (kind == DistributedFragmentKind::PARTITIONED_JOIN && !IsSimplePartitionedJoin(statement)) {
+		return exec_result;
+	}
 
 	auto workers = worker_manager.GetAvailableWorkers();
 	if (workers.empty()) {
@@ -79,6 +90,7 @@ DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string 
 	}
 
 	// Phase 1: Plan extraction and validation
+	// Refresh the plan for task partitioning; table storage may change after the client prepares the fragment.
 	unique_ptr<LogicalOperator> logical_plan = conn.ExtractPlan(sql);
 	if (logical_plan == nullptr) {
 		return exec_result;
@@ -89,10 +101,14 @@ DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string 
 		return exec_result;
 	}
 
-	// Analyze query to determine merge strategy
-	QueryPlanAnalyzer::QueryAnalysis query_analysis = plan_analyzer->AnalyzeQuery(*logical_plan, statement);
+	// The Join's aggregate rewrite was validated against the client plan during Prepare.
+	QueryPlanAnalyzer::QueryAnalysis query_analysis =
+	    join_analysis ? *join_analysis : QueryPlanAnalyzer::AnalyzeQuery(*logical_plan, statement);
 	const bool partitioned_aggregation = query_analysis.supports_partitioned_aggregation &&
 	                                     storage_config.storage_case() != distributed::StorageConfig::STORAGE_NOT_SET;
+	if (kind == DistributedFragmentKind::PARTITIONED_JOIN && !partitioned_aggregation) {
+		return exec_result;
+	}
 	// The partial query scans the same table with the same filters, so it is partitioned with the original plan.
 	const string &execution_sql = partitioned_aggregation ? query_analysis.partial_sql : sql;
 
@@ -101,6 +117,10 @@ DistributedExecutionResult DistributedExecutor::ExecuteDistributed(const string 
 	const idx_t partition_workers = query_analysis.has_aggregation && !partitioned_aggregation ? 1 : workers.size();
 	auto tasks = task_partitioner->ExtractPipelineTasks(*logical_plan, execution_sql, partition_workers);
 	if (tasks.empty()) {
+		return exec_result;
+	}
+	// Recheck at execution time: one task would reread the other input without parallelizing the Join.
+	if (kind == DistributedFragmentKind::PARTITIONED_JOIN && tasks.size() < 2) {
 		return exec_result;
 	}
 

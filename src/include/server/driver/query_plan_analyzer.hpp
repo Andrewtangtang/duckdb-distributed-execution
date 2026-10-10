@@ -7,6 +7,7 @@
 namespace duckdb {
 
 class SelectStatement;
+class LogicalGet;
 
 // Analyzes DuckDB logical/physical plans to extract information for distributed execution planning.
 class QueryPlanAnalyzer {
@@ -26,7 +27,7 @@ public:
 		// Whether row group info is available.
 		bool valid = false;
 	};
-	RowGroupPartitionInfo ExtractRowGroupInfo(LogicalOperator &logical_plan);
+	RowGroupPartitionInfo ExtractRowGroupInfo(LogicalGet &get);
 
 	// Merge strategy for distributed query results
 	enum class MergeStrategy {
@@ -47,7 +48,7 @@ public:
 		string partial_sql;
 		string final_sql;
 	};
-	QueryAnalysis AnalyzeQuery(LogicalOperator &logical_plan, const SelectStatement &statement);
+	static QueryAnalysis AnalyzeQuery(LogicalOperator &logical_plan, const SelectStatement &statement);
 
 private:
 	Connection &conn;
