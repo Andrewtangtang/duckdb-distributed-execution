@@ -20,15 +20,6 @@ string PlanSerializer::SerializeLogicalPlan(LogicalOperator &op) {
 	return string(reinterpret_cast<const char *>(data_ptr), stream.GetPosition());
 }
 
-string PlanSerializer::SerializeLogicalType(const LogicalType &type) {
-	MemoryStream stream;
-	BinarySerializer serializer(stream);
-	serializer.Begin();
-	type.Serialize(serializer);
-	serializer.End();
-	return string(reinterpret_cast<const char *>(stream.GetData()), stream.GetPosition());
-}
-
 unique_ptr<LogicalOperator> PlanSerializer::DeserializeLogicalPlan(ClientContext &context, const string &data) {
 	unique_ptr<LogicalOperator> plan;
 	// Table scans look up their tables by name, which needs a transaction.

@@ -1,31 +1,16 @@
 #include "arrow_utils.hpp"
 #include "core_functions_extension.hpp"
-#include "duckdb/common/arrow/arrow_appender.hpp"
-#include "duckdb/common/arrow/arrow_converter.hpp"
-#include "duckdb/common/arrow/arrow_util.hpp"
-#include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/common/string_util.hpp"
-#include "duckdb/common/enums/pending_execution_result.hpp"
-#include "duckdb/common/types/column/column_data_collection.hpp"
-#include "duckdb/execution/executor.hpp"
-#include "duckdb/execution/operator/helper/physical_result_collector.hpp"
 #include "duckdb/logging/logger.hpp"
-#include "duckdb/main/chunk_scan_state/query_result.hpp"
 #include "duckdb/main/config.hpp"
-#include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/parser/statement/logical_plan_statement.hpp"
-#include "duckdb/storage/storage_info.hpp"
 #include "server/driver/plan_serializer.hpp"
 #include "server/object_storage_database.hpp"
 #include "server/startup_sql.hpp"
 #include "server/validation.hpp"
 #include "server/worker/row_group_range_scan.hpp"
 #include "server/worker/worker_node.hpp"
-
-#include <arrow/array.h>
-#include <arrow/c/bridge.h>
-#include <chrono>
 
 namespace duckdb {
 
