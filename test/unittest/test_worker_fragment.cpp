@@ -615,6 +615,75 @@ TEST_CASE("Join fragments split tables ordered on the Join key by key ranges", "
 	std::filesystem::remove_all(root);
 }
 
+TEST_CASE("Worker fragments are cut inside materialized CTEs", "[worker_fragment]") {
+	auto root = CreateRoot("duckherder_cte");
+	{
+		FragmentFixture fixture(root);
+		auto &executor_connection = fixture.executor_connection;
+		REQUIRE_FALSE(executor_connection
+		                  ->Query("CREATE TABLE fact AS SELECT i AS id, i % 17 AS k, i % 11 AS amount "
+		                          "FROM range(300000) t(i)")
+		                  ->HasError());
+		REQUIRE_FALSE(
+		    executor_connection->Query("CREATE TABLE dim AS SELECT i AS k, i + 1 AS multiplier FROM range(17) t(i)")
+		        ->HasError());
+		REQUIRE(fixture.manager->StartLocalWorkers(2).ok());
+
+		// The CTE's definition becomes a fragment; the query reading it twice stays on the driver.
+		auto executions = fixture.RequireLocalResult(
+		    "WITH totals AS MATERIALIZED (SELECT k, sum(amount) AS total FROM fact GROUP BY k) "
+		    "SELECT d.multiplier, t.total FROM totals t JOIN dim d ON t.k = d.k "
+		    "WHERE t.total = (SELECT max(total) FROM totals)");
+		REQUIRE(executions.size() == 1);
+		REQUIRE(executions[0].execution_mode == QueryExecutionMode::ROW_GROUP_PARTITION);
+		REQUIRE(executions[0].sql == "aggregate sum_no_overflow(amount) group by k over object_db.main.fact");
+
+		// Workers do not have the CTE's result, so no fragment may read it.
+		executions =
+		    fixture.RequireLocalResult("WITH dims AS MATERIALIZED (SELECT k, multiplier FROM dim) "
+		                               "SELECT sum(f.amount * d.multiplier) FROM fact f JOIN dims d ON f.k = d.k");
+		REQUIRE(executions.size() == 1);
+		REQUIRE(executions[0].sql == "scan over object_db.main.dim");
+	}
+	std::filesystem::remove_all(root);
+}
+
+TEST_CASE("Inner Joins without an aggregate become fragments that return their rows", "[worker_fragment]") {
+	auto root = CreateRoot("duckherder_join_rows");
+	{
+		FragmentFixture fixture(root);
+		auto &executor_connection = fixture.executor_connection;
+		REQUIRE_FALSE(executor_connection
+		                  ->Query("CREATE TABLE fact AS SELECT i AS id, i % 17 AS k, i % 11 AS amount "
+		                          "FROM range(300000) t(i)")
+		                  ->HasError());
+		REQUIRE_FALSE(
+		    executor_connection->Query("CREATE TABLE dim AS SELECT i AS k, i + 1 AS multiplier FROM range(17) t(i)")
+		        ->HasError());
+		REQUIRE(fixture.manager->StartLocalWorkers(2).ok());
+
+		// The columns are selected in another order than the Join returns them, and the driver sorts the rows.
+		for (const auto &sql : {"SELECT d.multiplier, f.id FROM fact f JOIN dim d ON f.k = d.k WHERE f.amount = 3 "
+		                        "ORDER BY f.id",
+		                        "WITH pairs AS MATERIALIZED (SELECT f.amount, d.multiplier FROM fact f JOIN dim d "
+		                        "ON f.k = d.k) SELECT sum(amount * multiplier), count(*) FROM pairs"}) {
+			auto executions = fixture.RequireLocalResult(sql);
+			REQUIRE(executions.size() == 1);
+			REQUIRE(executions[0].num_tasks_generated == 2);
+			REQUIRE(executions[0].sql == "join over object_db.main.fact (partitioned), object_db.main.dim");
+		}
+		// A Join below an operator that reduces its rows stays local, including one in a CTE below an aggregate.
+		for (const auto &sql :
+		     {"SELECT DISTINCT d.multiplier FROM fact f JOIN dim d ON f.k = d.k ORDER BY ALL",
+		      "SELECT f.id, d.multiplier FROM fact f JOIN dim d ON f.k = d.k ORDER BY f.id LIMIT 10",
+		      "SELECT count(*) FROM (WITH pairs AS MATERIALIZED (SELECT f.amount, d.multiplier FROM fact f JOIN dim d "
+		      "ON f.k = d.k) SELECT * FROM pairs UNION ALL SELECT * FROM pairs)"}) {
+			REQUIRE(fixture.RequireLocalResult(sql).empty());
+		}
+	}
+	std::filesystem::remove_all(root);
+}
+
 TEST_CASE("Workers reject plans of another build and the driver runs them locally", "[worker_fragment]") {
 	auto root = CreateRoot("duckherder_build_mismatch");
 	{
