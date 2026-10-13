@@ -56,6 +56,12 @@ private:
 vector<string> SerializeTaskPlans(ClientContext &context, LogicalOperator &plan, LogicalGet &partitioned,
                                   idx_t max_tasks);
 
+// "auto" splits a Join when the cost model favors it, "always" whenever it has two tasks, "never" not at all.
+constexpr const char *JOIN_PARTITIONING_SETTING = "duckherder_join_partitioning";
+
+// Registers JOIN_PARTITIONING_SETTING.
+void RegisterJoinPartitioningSetting(DBConfig &config);
+
 // Registers the optimizer extension that replaces eligible scans and aggregates, over one table or an inner Join of
 // two, with worker fragments.
 void RegisterWorkerFragments(DBConfig &config);
