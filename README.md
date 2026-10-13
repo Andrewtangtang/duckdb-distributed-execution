@@ -595,6 +595,21 @@ SELECT * FROM dh.large_table WHERE value > 1000;
 DROP TABLE dh.users;
 ```
 
+### Worker dispatch threads
+
+The driver uses a reusable Arrow thread pool for blocking worker RPCs.
+`duckherder_async_threads` controls its maximum concurrency. The default value
+`0` enables automatic sizing: `min(4 * DuckDB threads, 256)`.
+
+```sql
+SET GLOBAL duckherder_async_threads = 8;
+RESET GLOBAL duckherder_async_threads; -- automatic sizing
+```
+
+Set this option in the driver database (for a standalone driver, through its
+startup SQL). It does not change worker query threads or Arrow's global I/O pool.
+
+
 ### Query Execution Monitoring and Statistics
 
 duckherder provides built-in stats (current not persisted anywhere) for executed queries, including start timestamp, executime duration and disribution mode.
@@ -751,17 +766,3 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development guidelines.
 ## License
 
 See [LICENSE](LICENSE) for license information.
-
-### Worker dispatch threads
-
-The driver uses a reusable Arrow thread pool for blocking worker RPCs.
-`duckherder_async_threads` controls its maximum concurrency. The default value
-`0` enables automatic sizing: `min(4 * DuckDB threads, 256)`.
-
-```sql
-SET GLOBAL duckherder_async_threads = 8;
-RESET GLOBAL duckherder_async_threads; -- automatic sizing
-```
-
-Set this option in the driver database (for a standalone driver, through its
-startup SQL). It does not change worker query threads or Arrow's global I/O pool.
