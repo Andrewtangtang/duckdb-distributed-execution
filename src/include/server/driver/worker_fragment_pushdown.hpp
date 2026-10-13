@@ -9,6 +9,7 @@ namespace duckdb {
 
 class Catalog;
 class Connection;
+class DBConfig;
 class DistributedExecutor;
 class LogicalGet;
 class LogicalOperator;
@@ -16,8 +17,6 @@ class TableCatalogEntry;
 
 // A part of a client's plan that workers run, serialized with PlanSerializer.
 struct WorkerFragment {
-	// A Join aggregate rendered as SQL, which the executor partitions itself; the plans are then empty.
-	string sql;
 	// The whole fragment, run on the driver if workers cannot run the tasks.
 	string plan;
 	// One plan per worker task, each reading a disjoint range of row groups of the partitioned table.
@@ -41,15 +40,10 @@ public:
 	// Returns the fragments executed since the last call.
 	vector<QueryExecutionInfo> TakeExecutions();
 	idx_t NumWorkers();
-	// Whether workers can run `sql`, rendered from the Join aggregate `plan`, as partitioned tasks.
-	bool CanPartitionJoin(LogicalOperator &plan, const string &sql);
 	// Whether the table belongs to the catalog served by this executor.
 	bool IsSameCatalog(const TableCatalogEntry &table) const;
 
 private:
-	vector<unique_ptr<DataChunk>> ExecuteJoinSQL(ClientContext &context, const string &sql,
-	                                             const vector<LogicalType> &types);
-
 	DistributedExecutor &executor;
 	Connection &connection;
 	Catalog &catalog;
@@ -62,7 +56,8 @@ private:
 vector<string> SerializeTaskPlans(ClientContext &context, LogicalOperator &plan, LogicalGet &partitioned,
                                   idx_t max_tasks);
 
-// Replaces eligible scans and aggregates, over one table or an inner Join of two, with worker fragments.
-OptimizerExtension GetWorkerFragmentExtension();
+// Registers the optimizer extension that replaces eligible scans and aggregates, over one table or an inner Join of
+// two, with worker fragments.
+void RegisterWorkerFragments(DBConfig &config);
 
 } // namespace duckdb
