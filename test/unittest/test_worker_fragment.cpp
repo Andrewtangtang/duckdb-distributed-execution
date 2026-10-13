@@ -16,6 +16,7 @@
 #include "duckdb/storage/table/row_group_segment_tree.hpp"
 #include "server/driver/distributed_executor.hpp"
 #include "server/driver/plan_serializer.hpp"
+#include "server/driver/query_utils.hpp"
 #include "server/driver/worker_fragment_pushdown.hpp"
 #include "server/driver/worker_manager.hpp"
 #include "server/driver/worker_node_client.hpp"
@@ -216,7 +217,7 @@ TEST_CASE("Optimizer sends a two-table Join aggregate through a worker fragment"
 		auto executions = fixture.RequireLocalResult(sql);
 		REQUIRE(executions.size() == 1);
 		REQUIRE(executions[0].execution_mode == QueryExecutionMode::ROW_GROUP_PARTITION);
-		REQUIRE(executions[0].merge_strategy == QueryPlanAnalyzer::MergeStrategy::AGGREGATE_MERGE);
+		REQUIRE(executions[0].merge_strategy == MergeStrategy::AGGREGATE_MERGE);
 		REQUIRE(executions[0].num_tasks_generated == 2);
 		REQUIRE(executions[0].sql ==
 		        "aggregate sum((amount * multiplier)) over object_db.main.fact (partitioned), object_db.main.dim");
