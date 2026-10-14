@@ -558,6 +558,17 @@ TEST_CASE("Only scans every output row comes from one row of are partitioned", "
 			REQUIRE(StringUtil::Contains(executions[0].sql, "skew (partitioned)"));
 			REQUIRE(executions[0].sql.find("(partitioned)") == executions[0].sql.rfind("(partitioned)"));
 		}
+		// A correlated subquery that stays a DELIM_JOIN. skew is not ordered on k, so only the outer skew is split and
+		// every task reads all of the inner one, which matches every correlated value. The cost model keeps the
+		// replicated skew local, so it is bypassed.
+		REQUIRE_FALSE(fixture.client->Query("SET duckherder_join_partitioning = 'always'")->HasError());
+		auto delim_executions = fixture.RequireLocalResult(
+		    "SELECT count(*), sum(s.amount) FROM skew s WHERE NOT EXISTS (SELECT 1 FROM skew s2 WHERE s2.k = s.k AND "
+		    "s2.amount > s.amount)");
+		REQUIRE_FALSE(fixture.client->Query("RESET duckherder_join_partitioning")->HasError());
+		REQUIRE(delim_executions.size() == 1);
+		INFO(delim_executions[0].sql);
+		REQUIRE(delim_executions[0].sql.find("(partitioned)") == delim_executions[0].sql.rfind("(partitioned)"));
 		// skew, the largest scan, is below an aggregate grouped by something other than a split key, so it is not
 		// split.
 		REQUIRE(
@@ -658,6 +669,17 @@ TEST_CASE("Join fragments split tables ordered on the Join key by key ranges", "
 			INFO(executions[0].sql);
 			REQUIRE(StringUtil::Contains(executions[0].sql, "item (partitioned)"));
 			REQUIRE(StringUtil::Contains(executions[0].sql, "ord (partitioned)"));
+		}
+		// Correlated subqueries become DELIM_JOINs. Split by the correlated key, each task holds whole subquery groups.
+		for (const auto &sql :
+		     {"SELECT count(*), sum(amount) FROM item i WHERE i.amount > (SELECT avg(i2.amount) FROM item i2 WHERE "
+		      "i2.i_key = i.i_key)",
+		      "SELECT count(*), sum(o.flag) FROM ord o WHERE NOT EXISTS (SELECT 1 FROM item i WHERE i.i_key = o.o_key "
+		      "AND i.amount > o.flag + 7)"}) {
+			executions = fixture.RequireLocalResult(sql);
+			REQUIRE(executions.size() == 1);
+			INFO(executions[0].sql);
+			REQUIRE(executions[0].sql.find("(partitioned)") != executions[0].sql.rfind("(partitioned)"));
 		}
 		// Items without a key make NOT IN unknown for every order without a match, so item is never split there. The
 		// cost model keeps the replicated item local, so it is bypassed.
