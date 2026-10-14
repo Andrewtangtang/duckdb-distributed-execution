@@ -39,6 +39,7 @@
 #include "server/driver/query_utils.hpp"
 #include "utils/sql_render_utils.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <utility>
 
@@ -162,41 +163,6 @@ bool CollectScans(LogicalOperator &op, const WorkerFragmentState &state, vector<
 	return true;
 }
 
-// Collects the scans whose rows can be split across tasks: those reached only through filters, projections and inner
-// Joins. Below an aggregate or another Join type, a partial input would change the result.
-void CollectPartitionableScans(LogicalOperator &op, vector<reference<LogicalGet>> &scans) {
-	switch (op.type) {
-	case LogicalOperatorType::LOGICAL_GET:
-		scans.emplace_back(op.Cast<LogicalGet>());
-		return;
-	case LogicalOperatorType::LOGICAL_FILTER:
-	case LogicalOperatorType::LOGICAL_PROJECTION:
-		break;
-	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
-		if (op.Cast<LogicalComparisonJoin>().join_type != JoinType::INNER) {
-			return;
-		}
-		break;
-	default:
-		return;
-	}
-	for (auto &child : op.children) {
-		CollectPartitionableScans(*child, scans);
-	}
-}
-
-// Collects the scans of op, whose input is input. Returns false unless workers can read every scan and each is reached
-// from input through filters, projections and inner Joins, so tasks can split any of them.
-bool CollectFragmentScans(LogicalOperator &op, LogicalOperator &input, const WorkerFragmentState &state,
-                          vector<reference<LogicalGet>> &scans) {
-	if (!CollectScans(op, state, scans)) {
-		return false;
-	}
-	vector<reference<LogicalGet>> candidates;
-	CollectPartitionableScans(input, candidates);
-	return !candidates.empty() && candidates.size() == scans.size();
-}
-
 optional_ptr<LogicalGet> FindScan(LogicalOperator &op, idx_t table_index) {
 	if (op.type == LogicalOperatorType::LOGICAL_GET && op.Cast<LogicalGet>().table_index == table_index) {
 		return op.Cast<LogicalGet>();
@@ -237,26 +203,38 @@ void AddRowIdRange(LogicalGet &get, idx_t start, optional_idx end) {
 	get.table_filters.PushFilter(ColumnIndex(COLUMN_IDENTIFIER_ROW_ID), std::move(filter));
 }
 
-// Returns the input of an equality Join in op that reads scan through filters and projections, or nullptr.
-optional_ptr<LogicalOperator> FindJoinInput(LogicalOperator &op, LogicalGet &scan) {
-	if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-		bool has_equality = false;
-		for (const auto &condition : op.Cast<LogicalComparisonJoin>().conditions) {
-			has_equality = has_equality || condition.comparison == ExpressionType::COMPARE_EQUAL;
-		}
+// Returns the input of a Join in op that reads scan through filters and projections, or nullptr, and sets equi_join to
+// whether that Join compares keys.
+optional_ptr<LogicalOperator> FindJoinInput(LogicalOperator &op, LogicalGet &scan, bool &equi_join) {
+	switch (op.type) {
+	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+	case LogicalOperatorType::LOGICAL_DELIM_JOIN:
+	case LogicalOperatorType::LOGICAL_ASOF_JOIN:
+	case LogicalOperatorType::LOGICAL_ANY_JOIN:
+	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
 		for (auto &child : op.children) {
 			auto *input = child.get();
 			while (input->type == LogicalOperatorType::LOGICAL_FILTER ||
 			       input->type == LogicalOperatorType::LOGICAL_PROJECTION) {
 				input = input->children[0].get();
 			}
-			if (has_equality && input == &scan) {
-				return child.get();
+			if (input != &scan) {
+				continue;
 			}
+			equi_join = false;
+			if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+				for (const auto &condition : op.Cast<LogicalComparisonJoin>().conditions) {
+					equi_join = equi_join || IsKeyComparison(condition.comparison);
+				}
+			}
+			return child.get();
 		}
+		break;
+	default:
+		break;
 	}
 	for (auto &child : op.children) {
-		auto result = FindJoinInput(*child, scan);
+		auto result = FindJoinInput(*child, scan, equi_join);
 		if (result) {
 			return result;
 		}
@@ -367,8 +345,9 @@ unique_ptr<LogicalOperator> ProjectColumns(Binder &binder, unique_ptr<LogicalOpe
 }
 
 // Writes fragment's plan and task plans from worker_plan, the workers' copy of a plan over input, and marks in split
-// which of scans the tasks split. A Join splits its input that reads the most, plus inputs ordered on a key they are
-// equi-joined on with it; the others are replicated. Returns false if a Join should stay local.
+// which of scans the tasks split. Tries the scans from the most read bytes down: by key ranges with the inputs
+// equi-joined to it on a key they are ordered on, else alone by rowid ranges; the others are replicated. Keeps the
+// first split AnalyzeSplit accepts. Returns false if there is none, or if a Join should stay local.
 bool PlanTasks(ClientContext &context, WorkerFragmentState &state, LogicalOperator &input,
                const vector<reference<LogicalGet>> &scans, LogicalOperator &worker_plan, WorkerFragment &fragment,
                vector<bool> &split) {
@@ -378,27 +357,53 @@ bool PlanTasks(ClientContext &context, WorkerFragmentState &state, LogicalOperat
 	if (scans.size() > 1 && join_partitioning == "never") {
 		return false;
 	}
-	// Partition the input that reads the most, so workers repeat the cheaper ones. Estimates are lost in serialization,
-	// so this is decided here, at the Join's inputs.
-	idx_t partitioned_idx = 0;
+	// Estimates are lost in serialization, so this is decided here, at the Join's inputs. The cost model assumes hash
+	// Joins, so a scan another Join reads stays local; a scan no Join reads directly, e.g. below an aggregate, is
+	// charged its own output.
 	vector<JoinInputCost> costs;
 	if (scans.size() > 1) {
 		for (const auto &scan : scans) {
-			auto join_input = FindJoinInput(input, scan.get());
-			auto cost = join_input ? EstimateJoinInputCost(*join_input, scan.get()) : std::nullopt;
+			bool equi_join = false;
+			auto join_input = FindJoinInput(input, scan.get(), equi_join);
+			if (join_input && !equi_join) {
+				return false;
+			}
+			auto cost = EstimateJoinInputCost(join_input ? *join_input : scan.get(), scan.get());
 			if (!cost) {
 				return false;
 			}
 			costs.emplace_back(*cost);
-			if (costs.back().scan_bytes > costs[partitioned_idx].scan_bytes) {
-				partitioned_idx = costs.size() - 1;
-			}
 		}
 	}
-	auto &partitioned = scans[partitioned_idx].get();
-	fragment.plan = PlanSerializer::SerializeLogicalPlan(worker_plan);
+	// Scan indexes, most read bytes first. A lone scan has no costs and is not compared.
+	vector<idx_t> order;
+	order.reserve(scans.size());
+	for (idx_t idx = 0; idx < scans.size(); ++idx) {
+		order.emplace_back(idx);
+	}
+	std::stable_sort(order.begin(), order.end(),
+	                 [&](idx_t a, idx_t b) { return costs[a].scan_bytes > costs[b].scan_bytes; });
+	optional_idx partitioned_idx;
 	KeyRangePartition key_ranges;
-	if (scans.size() > 1 && FindKeyRangePartition(input, partitioned, scans, costs, state.NumWorkers(), key_ranges)) {
+	for (const auto idx : order) {
+		auto &candidate = scans[idx].get();
+		if (scans.size() > 1 && FindKeyRangePartition(input, candidate, scans, costs, state.NumWorkers(), key_ranges) &&
+		    IsSplit(AnalyzeSplit(input, key_ranges, optional_idx()))) {
+			partitioned_idx = idx;
+			break;
+		}
+		key_ranges = KeyRangePartition();
+		if (IsSplit(AnalyzeSplit(input, key_ranges, candidate.table_index))) {
+			partitioned_idx = idx;
+			break;
+		}
+	}
+	if (!partitioned_idx.IsValid()) {
+		return false;
+	}
+	auto &partitioned = scans[partitioned_idx.GetIndex()].get();
+	fragment.plan = PlanSerializer::SerializeLogicalPlan(worker_plan);
+	if (!key_ranges.scans.empty()) {
 		fragment.task_plans = SerializeKeyRangeTaskPlans(context, worker_plan, key_ranges);
 	} else {
 		fragment.task_plans = SerializeTaskPlans(context, worker_plan, *FindScan(worker_plan, partitioned.table_index),
@@ -419,7 +424,7 @@ bool PlanTasks(ClientContext &context, WorkerFragmentState &state, LogicalOperat
 		}
 		// Split inputs count as partitioned; the others are replicated. A replicated input joins the stream of the
 		// largest split input, so only that input's build is compared with it.
-		JoinInputCost partitioned_cost {0, costs[partitioned_idx].build_bytes};
+		JoinInputCost partitioned_cost {0, costs[partitioned_idx.GetIndex()].build_bytes};
 		vector<JoinInputCost> replicated_costs;
 		for (idx_t idx = 0; idx < costs.size(); ++idx) {
 			if (split[idx]) {
@@ -448,7 +453,7 @@ unique_ptr<LogicalOperator> TryCreateAggregateFragment(ClientContext &context, B
 		return nullptr;
 	}
 	vector<reference<LogicalGet>> scans;
-	if (!CollectFragmentScans(aggregate, *aggregate.children[0], state, scans)) {
+	if (!CollectScans(aggregate, state, scans) || scans.empty()) {
 		return nullptr;
 	}
 	// Workers return the groups and partial aggregates. avg becomes a sum and a count, appended after the others.
@@ -614,13 +619,13 @@ unique_ptr<LogicalOperator> TryCreateScanFragment(ClientContext &context, Binder
 	return std::move(result);
 }
 
-// Replaces join, an inner Join of tables, with a fragment whose tasks each return the Join's rows for their part of
-// the input, split as PlanTasks decides. The driver concatenates the rows.
+// Replaces join with a fragment whose tasks each return the Join's rows for their part of the input, split as
+// PlanTasks decides. The driver concatenates the rows.
 unique_ptr<LogicalOperator> TryCreateJoinFragment(ClientContext &context, Binder &binder, WorkerFragmentState &state,
                                                   LogicalComparisonJoin &join,
                                                   vector<ReplacementBinding> &replacements) {
 	vector<reference<LogicalGet>> scans;
-	if (!CollectFragmentScans(join, join, state, scans)) {
+	if (!CollectScans(join, state, scans) || scans.empty()) {
 		return nullptr;
 	}
 	WorkerFragment fragment;
@@ -643,7 +648,7 @@ unique_ptr<LogicalOperator> TryCreateJoinFragment(ClientContext &context, Binder
 	return std::move(result);
 }
 
-// Replaces the first aggregate, inner Join or lone scan below root, following operators with one child, with a worker
+// Replaces the first aggregate, Join or lone scan below root, following operators with one child, with a worker
 // fragment. reduced is whether an operator above root reduces its rows.
 void CutFragment(ClientContext &context, Binder &binder, WorkerFragmentState &state, unique_ptr<LogicalOperator> &root,
                  bool reduced, vector<ReplacementBinding> &replacements) {
