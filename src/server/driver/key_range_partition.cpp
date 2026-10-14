@@ -215,12 +215,27 @@ vector<KeyRangeScan> EqualColumns(const KeyRangeScan &key, const vector<KeyPair>
 	return result;
 }
 
+// Whether type's row group minimums and maximums are exact and ordered like its comparisons, so key ranges prune row
+// groups. TIME_TZ statistics are not ordered by instant, floating-point ones have NaN and -0.0, and string ones are
+// truncated, so we exclude them.
+bool IsRangeKeyType(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::DECIMAL:
+	case LogicalTypeId::DATE:
+	case LogicalTypeId::TIME:
+	case LogicalTypeId::TIME_NS:
+		return true;
+	default:
+		return type.IsIntegral() || LogicalType::TypeIsTimestamp(type);
+	}
+}
+
 // Reads the minimum key of each row group of get's table, skipping those without keys. Returns false if a minimum is
 // unknown or the row groups are not ordered on the key, since key ranges would not prune them.
 bool ReadRowGroupMinimums(LogicalGet &get, column_t column, vector<Value> &minimums) {
 	auto &table = *get.GetTable();
 	auto &definition = table.GetColumn(LogicalIndex(column));
-	if (definition.Generated() || !definition.Type().IsIntegral()) {
+	if (definition.Generated() || !IsRangeKeyType(definition.Type())) {
 		return false;
 	}
 	auto row_groups = table.GetStorage().GetRowGroupCollection()->GetRowGroups();
