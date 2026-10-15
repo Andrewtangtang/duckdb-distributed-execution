@@ -24,8 +24,7 @@ namespace duckdb {
 
 class Connection;
 class DistributedExecutor;
-class DuckDB;
-class ObjectStorageDatabase;
+class ServedDatabase;
 class WorkerFragmentState;
 class WorkerManager;
 
@@ -34,9 +33,10 @@ enum class ClientRequestTransport : uint8_t { NONE, ACTION, DO_GET, DO_PUT };
 // Owns the Control Node resources and bounded transaction replay state for one registered client.
 struct ClientRegistration {
 	// Queries run locally when `executor_connection_p` is null.
-	ClientRegistration(ObjectStorageDatabase &db, unique_ptr<Connection> connection_p,
+	ClientRegistration(shared_ptr<ServedDatabase> served_database_p, unique_ptr<Connection> connection_p,
 	                   unique_ptr<Connection> executor_connection_p, WorkerManager &worker_manager,
 	                   distributed::ClientRole role_p, const distributed::StorageConfig &storage_config);
+	// Releases the client's admission to its database.
 	~ClientRegistration();
 
 	// Validate a transaction-scoped request and indicate whether its latest result can be replayed.
@@ -53,10 +53,8 @@ struct ClientRegistration {
 	void ClearRequestReplay() DUCKDB_REQUIRES(connection_mutex);
 
 	distributed::ClientRole role;
-	// Storage identity, excluding credentials, for the database this client is attached to.
-	const string database_key;
 	// Declared before the connection so the instance outlives every session opened on it.
-	shared_ptr<DuckDB> database;
+	shared_ptr<ServedDatabase> served_database;
 	// Last authorized request time in steady-clock milliseconds, updated concurrently by RPC handlers.
 	atomic<int64_t> last_seen;
 	// DuckDB connections are session-scoped and must not execute concurrent requests.

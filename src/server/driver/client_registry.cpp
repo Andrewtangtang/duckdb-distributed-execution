@@ -18,25 +18,32 @@ arrow::Status ClientRegistry::Register(const distributed::RegisterClientRequest 
 		resp.set_error_message(validation.message());
 		return arrow::Status::OK();
 	}
-	const concurrency::unique_lock<concurrency::shared_mutex> lock(mutex);
-	PruneExpired();
+	{
+		// Expired clients release their admission when destroyed, which must happen before admitting this client.
+		vector<shared_ptr<ClientRegistration>> expired;
+		const concurrency::unique_lock<concurrency::shared_mutex> lock(mutex);
+		PruneExpired(expired);
+	}
 	auto storage_config = ObjectStorageDatabase::ResolveConfig(req.storage_config());
-	auto storage_key = ObjectStorageDatabase::GetKey(storage_config);
-	auto &database = databases[storage_key];
+	shared_ptr<ServedDatabase> database;
+	const concurrency::unique_lock<concurrency::shared_mutex> lock(mutex);
+	auto &entry = databases[ObjectStorageDatabase::GetKey(storage_config)];
+	database = entry.lock();
 	if (!database) {
-		database = make_uniq<ServedDatabase>(storage_config);
+		database = make_shared_ptr<ServedDatabase>(storage_config);
+		entry = database;
+		if (database->IsDefault()) {
+			default_database = database;
+		}
 	}
 
-	auto client_id = UUID::ToString(UUID::GenerateRandomUUID());
 	auto registration = database->AddClient(req.role(), worker_manager);
 	if (!registration.ok()) {
-		if (!database->HasClients() && !database->IsDefault()) {
-			databases.erase(storage_key);
-		}
 		resp.set_success(false);
 		resp.set_error_message(registration.status().message());
 		return arrow::Status::OK();
 	}
+	auto client_id = UUID::ToString(UUID::GenerateRandomUUID());
 	clients.emplace(client_id, std::move(registration).ValueOrDie());
 	resp.set_success(true);
 	resp.mutable_register_client()->set_client_id(client_id);
@@ -44,10 +51,14 @@ arrow::Status ClientRegistry::Register(const distributed::RegisterClientRequest 
 }
 
 arrow::Status ClientRegistry::Unregister(const string &client_id, distributed::DistributedResponse &resp) {
-	const concurrency::unique_lock<concurrency::shared_mutex> lock(mutex);
-	auto entry = clients.find(client_id);
-	if (entry != clients.end()) {
-		Remove(entry);
+	shared_ptr<ClientRegistration> removed;
+	{
+		const concurrency::unique_lock<concurrency::shared_mutex> lock(mutex);
+		auto entry = clients.find(client_id);
+		if (entry != clients.end()) {
+			removed = std::move(entry->second);
+			clients.erase(entry);
+		}
 	}
 	resp.set_success(true);
 	resp.mutable_unregister_client();
@@ -55,11 +66,16 @@ arrow::Status ClientRegistry::Unregister(const string &client_id, distributed::D
 }
 
 void ClientRegistry::Clear() {
-	clients.clear();
+	unordered_map<string, shared_ptr<ClientRegistration>> removed_clients;
+	shared_ptr<ServedDatabase> removed_default;
+	const concurrency::unique_lock<concurrency::shared_mutex> lock(mutex);
+	removed_clients.swap(clients);
+	removed_default = std::move(default_database);
 	databases.clear();
 }
 
 bool ClientRegistry::Lookup(const string &client_id, shared_ptr<ClientRegistration> &registration) {
+	const concurrency::shared_lock<concurrency::shared_mutex> lock(mutex);
 	auto entry = clients.find(client_id);
 	if (entry == clients.end()) {
 		return false;
@@ -72,7 +88,7 @@ bool ClientRegistry::Authorize(const string &client_id, distributed::ClientRole 
                                shared_ptr<ClientRegistration> &registration, distributed::DistributedResponse &resp) {
 	if (!Lookup(client_id, registration)) {
 		resp.set_success(false);
-		resp.set_error_message("Duckherder client is not registered with the control node");
+		resp.set_error_message(NOT_REGISTERED_ERROR);
 		return false;
 	}
 	if (required_role == distributed::CLIENT_ROLE_READ_WRITE &&
@@ -89,24 +105,21 @@ void ClientRegistry::Touch(const shared_ptr<ClientRegistration> &registration) {
 	registration->last_seen = GetSteadyNowMilliSecSinceEpoch();
 }
 
-void ClientRegistry::PruneExpired() {
+void ClientRegistry::PruneExpired(vector<shared_ptr<ClientRegistration>> &expired) {
 	const auto expiration = GetSteadyNowMilliSecSinceEpoch() - test_state.GetClientLeaseTimeout().count();
 	for (auto entry = clients.begin(); entry != clients.end();) {
 		auto current = entry++;
 		if (current->second->last_seen.load() < expiration) {
-			Remove(current);
+			expired.emplace_back(std::move(current->second));
+			clients.erase(current);
 		}
 	}
-}
-
-void ClientRegistry::Remove(ClientMap::iterator entry) {
-	auto database = databases.find(entry->second->database_key);
-	D_ASSERT(database != databases.end());
-	database->second->RemoveClient(entry->second->role);
-	if (!database->second->HasClients() && !database->second->IsDefault()) {
-		databases.erase(database);
+	for (auto entry = databases.begin(); entry != databases.end();) {
+		auto current = entry++;
+		if (current->second.expired()) {
+			databases.erase(current);
+		}
 	}
-	clients.erase(entry);
 }
 
 } // namespace duckdb
