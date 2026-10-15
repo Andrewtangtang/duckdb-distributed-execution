@@ -11,6 +11,7 @@
 #include "server/validation.hpp"
 #include "server/worker/row_group_range_scan.hpp"
 #include "server/worker/worker_node.hpp"
+#include "utils/profile_log.hpp"
 
 namespace duckdb {
 
@@ -97,11 +98,23 @@ arrow::Status WorkerNode::HandleExecutePartition(const distributed::ExecuteParti
 	if (req.storage_config().storage_case() == distributed::StorageConfig::kInMemory) {
 		return arrow::Status::Invalid("Workers cannot execute on control-node in-memory object storage");
 	}
+	const auto profile_dir = ProfileDir();
+	const auto received_ms = EpochMillis();
 	ARROW_ASSIGN_OR_RAISE(auto object_storage_database, GetOrOpenObjectStorageDatabase(req.storage_config()));
 	ARROW_ASSIGN_OR_RAISE(auto task_conn, object_storage_database->Connect());
+	const auto opened_ms = EpochMillis();
+	if (!profile_dir.empty()) {
+		EnableQueryProfile(*task_conn, profile_dir, StringUtil::Format("worker-%s-%lld", worker_id, received_ms));
+	}
 
 	unique_ptr<QueryResult> result;
 	ARROW_RETURN_NOT_OK(ExecutePlanFragment(req, *task_conn, result));
+	if (!profile_dir.empty()) {
+		// The query keeps running after this: Flight pulls its batches. Its JSON profile has the execution time.
+		AppendProfileLine(profile_dir, "workers.tsv",
+		                  StringUtil::Format("%s\t%lld\t%lld\t%lld", worker_id, received_ms, opened_ms - received_ms,
+		                                     EpochMillis() - opened_ms));
+	}
 
 	// This represents the LocalState output from this worker node; the coordinator combines the outputs of all
 	// workers, mirroring how thread-local sink states are combined into a global state. The reader pulls batches from

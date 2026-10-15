@@ -13,6 +13,7 @@
 #include "server/driver/query_history.hpp"
 #include "server/driver/query_utils.hpp"
 #include "server/driver/worker_fragment_pushdown.hpp"
+#include "utils/profile_log.hpp"
 #include "utils/remote_error.hpp"
 
 #include <arrow/buffer.h>
@@ -207,6 +208,10 @@ arrow::Status ClientRequestHandler::RunQuery(const distributed::QueryRequest &re
                                              vector<std::shared_ptr<arrow::RecordBatch>> &batches) {
 	const auto &sql = req.sql();
 	DUCKDB_LOG_DEBUG(db_instance, StringUtil::Format("Handling query: %s", sql));
+	const auto profile_dir = ProfileDir();
+	if (!profile_dir.empty()) {
+		EnableQueryProfile(*registration.connection, profile_dir, StringUtil::Format("driver-%lld", EpochMillis()));
+	}
 
 	auto prepared = registration.connection->Prepare(sql);
 	if (prepared->HasError()) {

@@ -41,6 +41,7 @@
 #include "server/driver/key_range_partition.hpp"
 #include "server/driver/plan_serializer.hpp"
 #include "server/driver/query_utils.hpp"
+#include "utils/profile_log.hpp"
 #include "utils/sql_render_utils.hpp"
 
 #include <arrow/flight/client.h>
@@ -104,7 +105,9 @@ public:
 			info.merge_strategy = fragment.merge_strategy;
 			info.num_workers_used = task_streams.size();
 			info.num_tasks_generated = task_streams.size();
+			dispatch_ms = ElapsedMillis();
 			const concurrency::lock_guard<concurrency::mutex> lock(mu);
+			stream_end_ms.assign(task_streams.size(), 0);
 			streams = std::move(task_streams);
 			return;
 		}
@@ -145,10 +148,11 @@ public:
 				ArrowRecordBatchToDataChunk(context, *next->data, *chunk, &fragment.types);
 				return chunk;
 			}
-			stream_idx = optional_idx();
 			bool all_finished;
 			{
 				const concurrency::lock_guard<concurrency::mutex> lock(mu);
+				stream_end_ms[stream_idx.GetIndex()] = ElapsedMillis();
+				stream_idx = optional_idx();
 				all_finished = ++finished_streams == streams.size();
 			}
 			if (all_finished) {
@@ -172,9 +176,26 @@ public:
 	}
 
 private:
+	int64_t ElapsedMillis() const {
+		return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start_time)
+		    .count();
+	}
+
 	void RecordExecution() {
 		info.query_duration =
 		    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start_time);
+		const auto profile_dir = ProfileDir();
+		if (!profile_dir.empty()) {
+			// Called once every stream has ended, so stream_end_ms is no longer written.
+			string task_ends;
+			for (auto end_ms : stream_end_ms) {
+				task_ends += (task_ends.empty() ? "" : ",") + std::to_string(end_ms);
+			}
+			const auto start_epoch_ms = EpochMillis() - info.query_duration.count();
+			AppendProfileLine(profile_dir, "fragments.tsv",
+			                  StringUtil::Format("%lld\t%lld\t%lld\t%s\t%s", start_epoch_ms, dispatch_ms,
+			                                     info.query_duration.count(), task_ends, info.sql));
+		}
 		fragment_state->RecordExecution(std::move(info));
 	}
 
@@ -184,6 +205,9 @@ private:
 	bool started DUCKDB_GUARDED_BY(start_mu) = false;
 	// Written by Start, and read once the fragment has ended.
 	std::chrono::steady_clock::time_point start_time;
+	// Milliseconds from start_time until every task started, and until each task's stream ended.
+	int64_t dispatch_ms = 0;
+	vector<int64_t> stream_end_ms;
 	QueryExecutionInfo info;
 	concurrency::mutex mu;
 	vector<std::unique_ptr<arrow::flight::FlightStreamReader>> streams DUCKDB_GUARDED_BY(mu);
