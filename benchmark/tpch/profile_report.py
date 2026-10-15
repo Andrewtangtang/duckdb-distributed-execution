@@ -83,7 +83,7 @@ def main():
             task_profile = worker_profiles.get((worker, received), {})
             # CPU time well below run time x threads means the task mostly waited, e.g. on storage.
             print(f"   {worker} +{(received - start_ms) / 1000:.2f}s: attach {open_ms / 1000:.2f}s, "
-                  f"plan {start_task_ms / 1000:.2f}s, run {task_profile.get('latency', 0.0):.2f}s, "
+                  f"first batch {start_task_ms / 1000:.2f}s, run {task_profile.get('latency', 0.0):.2f}s, "
                   f"cpu {task_profile.get('cpu_time', 0.0):.2f}s, "
                   f"read {task_profile.get('total_bytes_read', 0) / 2**20:.0f} MiB")
             print(f"     {top(task_profile)}")
