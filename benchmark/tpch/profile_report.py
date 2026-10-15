@@ -2,8 +2,9 @@
 """Summarize a DUCKHERDER_PROFILE_DIR: per query, the driver's time, each fragment's task end times, and each worker
 task's attach time and slowest operators.
 
-Usage: profile_report.py <profile_dir> [query numbers in run order, e.g. 10 17 18]
+Usage: profile_report.py <profile_dir> <bench run directory, e.g. results/<time>-sf10/runs-n3>
 """
+import re
 import json
 import sys
 from pathlib import Path
@@ -46,16 +47,26 @@ def read_tsv(path):
 
 def main():
     directory = Path(sys.argv[1])
-    labels = sys.argv[2:]
-    queries = [(ms, profile) for ms, _, profile in load_profiles(directory, "driver")
-               if "duckdb_schemas()" not in profile.get("query_name", "")]
+    # Each run log ends with the SQL its query sent to the driver; profiles of other queries, e.g. the client loading
+    # the catalog, are skipped.
+    runs = {}
+    for log in Path(sys.argv[2]).glob("q*.log"):
+        # The SQL is in a CSV field there, with quotes doubled.
+        runs[log.read_text().replace('""', '"')] = re.match(r"q(\d+)", log.name).group(1)
+    queries = []
+    for ms, _, profile in load_profiles(directory, "driver"):
+        sql = profile.get("query_name", "")
+        if not sql or "duckdb_schemas()" in sql:
+            continue
+        label = next((query for text, query in runs.items() if sql in text), None)
+        if label:
+            queries.append((ms, f"Q{label}", profile))
     fragments = [(int(f[0]), int(f[1]), int(f[2]), [int(x) for x in f[3].split(",") if x], f[4])
                  for f in read_tsv(directory / "fragments.tsv")]
     tasks = [(int(t[1]), t[0], int(t[2]), int(t[3])) for t in read_tsv(directory / "workers.tsv")]
     worker_profiles = {(worker, ms): profile for ms, worker, profile in load_profiles(directory, "worker")}
 
-    for idx, (start_ms, profile) in enumerate(queries):
-        label = f"Q{labels[idx]}" if idx < len(labels) else f"query {idx + 1}"
+    for idx, (start_ms, label, profile) in enumerate(queries):
         latency = profile.get("latency", 0.0)
         end_ms = queries[idx + 1][0] if idx + 1 < len(queries) else float("inf")
         print(f"== {label}: driver {latency:.2f}s")
